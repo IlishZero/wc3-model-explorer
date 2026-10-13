@@ -19,6 +19,8 @@ import com.hiveworkshop.model.*;
 import com.hiveworkshop.parser.*;
 
 import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
 import javax.swing.DefaultListCellRenderer;
 import javax.swing.DefaultListModel;
 import javax.swing.ImageIcon;
@@ -30,6 +32,7 @@ import javax.swing.JList;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
+import javax.swing.JSplitPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
@@ -115,6 +118,8 @@ public final class MainWindow extends JFrame {
     private final JComboBox<SortOrder> sortCombo = new JComboBox<>(SortOrder.values());
     private final JToggleButton advancedFiltersToggle = new JToggleButton(get("main.advancedFilters"));
     private final JButton exportCsvButton = new JButton(get("main.exportCsv"));
+    private final JToggleButton listViewToggle = new JToggleButton(get("main.listView"));
+    private final JToggleButton quickPreviewToggle = new JToggleButton(get("main.preview"));
     private final JComboBox<TextureHealthFilter> texHealthCombo = new JComboBox<>(TextureHealthFilter.values());
     private final JPanel chipsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
     private final JPanel advancedFiltersPanel = new JPanel(new BorderLayout());
@@ -124,7 +129,7 @@ public final class MainWindow extends JFrame {
     private final JTextField textureFilterField = new JTextField();
     private final JTextField minPolygonsField = new JTextField();
     private final JTextField maxPolygonsField = new JTextField();
-    private final JPanel tagButtonsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+    private final JPanel tagButtonsPanel = new JPanel();
     private final java.util.Map<String, TagState> tagStates = new java.util.LinkedHashMap<>();
     private final JTextField minSizeKbField = new JTextField();
     private final JTextField maxSizeKbField = new JTextField();
@@ -139,6 +144,7 @@ public final class MainWindow extends JFrame {
     private final AppSettings settings = AppSettings.loadDefault();
     /** Above this many selected models, "Open in viewer" asks for confirmation first. */
     private static final int OPEN_IN_VIEWER_WARN_THRESHOLD = 10;
+    private static final int LIST_ROW_HEIGHT = 56;
     private int baseCardWidth;
     private int baseCardHeight;
     private Timer progressiveLoadTimer;
@@ -146,6 +152,19 @@ public final class MainWindow extends JFrame {
     private volatile java.util.concurrent.atomic.AtomicBoolean scanCancelled;
     private ThumbnailRenderer thumbnailRenderer;
     private FlipbookManager flipbook;
+    private final AssetCellRenderer gridRenderer = new AssetCellRenderer();
+    private final ListRowRenderer listRowRenderer = new ListRowRenderer();
+    private JScrollPane listScrollPane;
+    private JSplitPane listSplitPane;
+    private JPanel quickPreviewPanel;
+    private ShimmerPreviewLabel qpPreview;
+    private JLabel qpName;
+    private JLabel qpPath;
+    private JLabel qpStats;
+    private JLabel qpTags;
+    private JButton qpOpen;
+    private JButton qpFav;
+    private JButton qpCopyTex;
     private Timer shimmerTimer;
     private int pendingThumbnails;
     private int totalThumbnails;
@@ -225,6 +244,8 @@ public final class MainWindow extends JFrame {
         filterControls.add(thumbnailTeamColorCombo);
         filterControls.add(favoritesToggle);
         filterControls.add(advancedFiltersToggle);
+        filterControls.add(listViewToggle);
+        filterControls.add(quickPreviewToggle);
         filterControls.add(exportCsvButton);
         filterRow.add(filterControls, BorderLayout.EAST);
         chipsPanel.setVisible(false);
@@ -234,20 +255,28 @@ public final class MainWindow extends JFrame {
         advancedFiltersPanel.setVisible(false);
 
         assetList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
-        assetList.setCellRenderer(new AssetCellRenderer());
+        assetList.setCellRenderer(gridRenderer);
         assetList.setLayoutOrientation(JList.HORIZONTAL_WRAP);
         assetList.setVisibleRowCount(-1);
         assetList.setDragEnabled(true);
         assetList.setTransferHandler(new AssetFileTransferHandler());
-        JScrollPane listScrollPane = new JScrollPane(assetList);
-        listScrollPane.getViewport().addChangeListener(e -> adjustCardWidth(listScrollPane));
+        listScrollPane = new JScrollPane(assetList);
+        listScrollPane.getViewport().addChangeListener(e -> {
+            adjustCardWidth(listScrollPane);
+            adjustListRowWidth();
+        });
 
         JPanel topContainer = new JPanel(new BorderLayout(0, 8));
         topContainer.add(topPanel, BorderLayout.NORTH);
         topContainer.add(advancedFiltersPanel, BorderLayout.CENTER);
 
         rootPanel.add(topContainer, BorderLayout.NORTH);
-        rootPanel.add(listScrollPane, BorderLayout.CENTER);
+        buildQuickPreviewPanel();
+        listSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, true,
+                listScrollPane, quickPreviewPanel);
+        listSplitPane.setResizeWeight(1.0);
+        listSplitPane.setBorder(null);
+        rootPanel.add(listSplitPane, BorderLayout.CENTER);
         JPanel bottomBar = new JPanel(new BorderLayout(8, 0));
         bottomBar.add(statusLabel, BorderLayout.CENTER);
         dataSourceLabel.setForeground(new Color(120, 130, 140));
@@ -284,8 +313,13 @@ public final class MainWindow extends JFrame {
         favoritesToggle.addActionListener(event -> applyFilter());
         exportCsvButton.addActionListener(event -> exportCsv());
         texHealthCombo.addActionListener(event -> applyFilter());
+        listViewToggle.addActionListener(event -> applyViewMode());
+        quickPreviewToggle.addActionListener(event -> applyQuickPreviewVisibility());
         assetList.addListSelectionListener(event -> {
-            if (!event.getValueIsAdjusting()) updateFlipbook();
+            if (!event.getValueIsAdjusting()) {
+                updateFlipbook();
+                updateQuickPreview();
+            }
         });
         rootField.addActionListener(event -> startScan(false));
         advancedFiltersToggle.addActionListener(event -> {
@@ -647,6 +681,12 @@ public final class MainWindow extends JFrame {
         favoritesToggle.setText(get("main.favorites"));
         recentButton.setText(get("main.recent"));
         advancedFiltersToggle.setText(get("main.advancedFilters"));
+        listViewToggle.setText(get("main.listView"));
+        quickPreviewToggle.setText(get("main.preview"));
+        if (qpOpen != null) {
+            qpOpen.setText(get("main.qp.openViewer"));
+            qpCopyTex.setText(get("main.copyWithTextures"));
+        }
         searchLabel.setText(get("main.search"));
         sortLabel.setText(get("main.sort"));
         teamLabel.setText(get("main.team"));
@@ -686,6 +726,7 @@ public final class MainWindow extends JFrame {
 
         // Refresh status bar and list
         updateDataSourceLabel();
+        updateQuickPreview();
         applyFilter();
     }
 
@@ -740,6 +781,10 @@ public final class MainWindow extends JFrame {
         } catch (IllegalArgumentException ex) {
             texHealthCombo.setSelectedItem(TextureHealthFilter.ALL);
         }
+        listViewToggle.setSelected("LIST".equals(settings.uiString("viewMode", "GRID")));
+        applyViewMode();
+        quickPreviewToggle.setSelected(settings.uiBool("quickPreview", true));
+        applyQuickPreviewVisibility();
         // Reveal the advanced panel if any advanced filter was restored, so the
         // active filtering is visible to the user rather than silently applied.
         boolean anyAdvanced = !animationFilterField.getText().isEmpty()
@@ -773,6 +818,8 @@ public final class MainWindow extends JFrame {
         settings.setUiPref("filterMinSizeKb", minSizeKbField.getText());
         settings.setUiPref("filterMaxSizeKb", maxSizeKbField.getText());
         settings.setUiPref("filterTexHealth", selectedTexHealth().name());
+        settings.setUiPref("viewMode", listViewToggle.isSelected() ? "LIST" : "GRID");
+        settings.setUiPref("quickPreview", quickPreviewToggle.isSelected());
         settings.save();
     }
 
@@ -1537,6 +1584,185 @@ public final class MainWindow extends JFrame {
         showModelDetails(asset, 0);
     }
 
+    // ── View mode & quick preview ────────────────────────────────────────
+
+    private void applyViewMode() {
+        boolean list = listViewToggle.isSelected();
+        if (list) {
+            assetList.setLayoutOrientation(JList.VERTICAL_WRAP);
+            assetList.setCellRenderer(listRowRenderer);
+            assetList.setFixedCellHeight(LIST_ROW_HEIGHT);
+            adjustListRowWidth();
+        } else {
+            assetList.setLayoutOrientation(JList.HORIZONTAL_WRAP);
+            assetList.setCellRenderer(gridRenderer);
+            updateCardSizing();
+            adjustCardWidth(listScrollPane);
+        }
+        assetList.revalidate();
+        assetList.repaint();
+    }
+
+    private void adjustListRowWidth() {
+        if (!listViewToggle.isSelected() || listScrollPane == null) return;
+        int w = listScrollPane.getViewport().getWidth();
+        if (w > 0 && assetList.getFixedCellWidth() != w - 4) {
+            assetList.setFixedCellWidth(w - 4);
+        }
+    }
+
+    private void applyQuickPreviewVisibility() {
+        if (quickPreviewPanel == null) return;
+        boolean show = quickPreviewToggle.isSelected();
+        quickPreviewPanel.setVisible(show);
+        if (show && listSplitPane != null) listSplitPane.resetToPreferredSizes();
+        if (listSplitPane != null) listSplitPane.revalidate();
+        updateQuickPreview();
+    }
+
+    private void buildQuickPreviewPanel() {
+        quickPreviewPanel = new JPanel(new BorderLayout(0, 8));
+        quickPreviewPanel.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
+        quickPreviewPanel.setPreferredSize(new Dimension(280, 0));
+
+        qpPreview = new ShimmerPreviewLabel();
+        qpPreview.setOpaque(true);
+        qpPreview.setBackground(new Color(24, 28, 34));
+        qpPreview.setForeground(new Color(228, 233, 239));
+        qpPreview.setHorizontalAlignment(JLabel.CENTER);
+        qpPreview.setPreferredSize(new Dimension(256, 256));
+        quickPreviewPanel.add(qpPreview, BorderLayout.NORTH);
+
+        JPanel center = new JPanel();
+        center.setLayout(new BoxLayout(center, BoxLayout.Y_AXIS));
+        center.setOpaque(false);
+        qpName = new JLabel();
+        qpName.setFont(qpName.getFont().deriveFont(Font.BOLD, 13f));
+        qpName.setAlignmentX(Component.LEFT_ALIGNMENT);
+        qpPath = new JLabel();
+        qpPath.setFont(qpPath.getFont().deriveFont(10f));
+        qpPath.setForeground(new Color(120, 130, 140));
+        qpPath.setAlignmentX(Component.LEFT_ALIGNMENT);
+        qpStats = new JLabel();
+        qpStats.setFont(qpStats.getFont().deriveFont(11f));
+        qpStats.setAlignmentX(Component.LEFT_ALIGNMENT);
+        qpTags = new JLabel();
+        qpTags.setFont(qpTags.getFont().deriveFont(10f));
+        qpTags.setForeground(new Color(80, 130, 180));
+        qpTags.setAlignmentX(Component.LEFT_ALIGNMENT);
+        center.add(qpName);
+        center.add(Box.createVerticalStrut(2));
+        center.add(qpPath);
+        center.add(Box.createVerticalStrut(8));
+        center.add(qpStats);
+        center.add(Box.createVerticalStrut(6));
+        center.add(qpTags);
+        quickPreviewPanel.add(center, BorderLayout.CENTER);
+
+        JPanel buttons = new JPanel(new GridLayout(0, 1, 0, 6));
+        qpOpen = new JButton(get("main.qp.openViewer"));
+        qpFav = new JButton();
+        qpCopyTex = new JButton(get("main.copyWithTextures"));
+        buttons.add(qpOpen);
+        buttons.add(qpFav);
+        buttons.add(qpCopyTex);
+        quickPreviewPanel.add(buttons, BorderLayout.SOUTH);
+
+        qpOpen.addActionListener(e -> {
+            List<ModelAsset> sel = selectedAssets();
+            if (!sel.isEmpty()) showModelDetails(sel.get(0), 0);
+        });
+        qpFav.addActionListener(e -> {
+            List<ModelAsset> sel = selectedAssets();
+            if (sel.isEmpty()) return;
+            settings.toggleFavorite(sel.get(0).path().toAbsolutePath().toString());
+            settings.save();
+            assetList.repaint();
+            updateQuickPreview();
+        });
+        qpCopyTex.addActionListener(e -> copyModelsWithTextures(selectedAssets()));
+        updateQuickPreview();
+    }
+
+    /** Refresh the quick-preview panel from the current selection (first item). */
+    private void updateQuickPreview() {
+        if (quickPreviewPanel == null) return;
+        List<ModelAsset> sel = selectedAssets();
+        if (sel.isEmpty()) {
+            qpPreview.setThumbnail(null, 256);
+            qpPreview.setText(get("main.qp.empty"));
+            qpName.setText("");
+            qpPath.setText("");
+            qpStats.setText("");
+            qpTags.setText("");
+            qpOpen.setEnabled(false);
+            qpFav.setEnabled(false);
+            qpCopyTex.setEnabled(false);
+            return;
+        }
+        ModelAsset asset = sel.get(0);
+        updateQuickPreviewImage(asset);
+
+        String name = asset.fileName();
+        String mName = asset.metadata().modelName();
+        if (!mName.isEmpty() && !mName.equalsIgnoreCase(name.replaceFirst("\\.[^.]+$", ""))) {
+            name += " (" + mName + ")";
+        }
+        if (sel.size() > 1) name += "  (+" + (sel.size() - 1) + ")";
+        qpName.setText(name);
+        qpPath.setText("<html>" + asset.path() + "</html>");
+
+        ModelMetadata meta = asset.metadata();
+        NumberFormat nfmt = NumberFormat.getIntegerInstance();
+        TextureHealth th = asset.texHealth();
+        StringBuilder sb = new StringBuilder("<html>");
+        sb.append(asset.fileExtension().toUpperCase(Locale.ROOT))
+                .append(" &nbsp;·&nbsp; ").append(formatByteSize(asset.fileSizeBytes()));
+        if (meta.hasKnownPolygonCount()) {
+            sb.append("<br>").append(fmt("main.tooltip.polygons", nfmt.format(meta.polygonCount())));
+            sb.append("<br>").append(fmt("main.tooltip.vertices", nfmt.format(meta.vertexCount())));
+            sb.append("<br>").append(fmt("main.tooltip.bones", nfmt.format(meta.boneCount())));
+            sb.append("<br>").append(fmt("main.tooltip.sequences", nfmt.format(meta.sequenceCount())));
+        }
+        if (th != null) {
+            sb.append("<br>");
+            if (th.missing() > 0) sb.append("<font color='#c05040'>");
+            sb.append(fmt("main.tooltip.texHealth", th.found(), th.total()));
+            if (th.missing() > 0) sb.append("</font>");
+        }
+        sb.append("</html>");
+        qpStats.setText(sb.toString());
+
+        List<String> tags = getEffectiveTags(asset);
+        qpTags.setText(tags.isEmpty() ? "" : String.join(", ", tags));
+
+        boolean hd = asset.metadata().isHd();
+        qpOpen.setEnabled(!hd);
+        qpCopyTex.setEnabled(!hd);
+        qpFav.setEnabled(true);
+        qpFav.setText(settings.isFavorite(asset.path().toAbsolutePath().toString())
+                ? get("main.qp.unfavorite") : get("main.qp.favorite"));
+    }
+
+    private void updateQuickPreviewImage(ModelAsset asset) {
+        if (asset.metadata().isHd()) {
+            qpPreview.setUnsupported(256);
+            qpPreview.setText(get("main.hdUnsupportedBadge"));
+            return;
+        }
+        BufferedImage img = flipbook != null ? flipbook.currentFrame(asset.path()) : null;
+        if (img == null && thumbnailRenderer != null) {
+            img = thumbnailRenderer.getThumbnail(asset.path());
+        }
+        if (img != null) {
+            qpPreview.setThumbnail(img, 256);
+            qpPreview.setText("");
+        } else {
+            qpPreview.setThumbnail(null, 256);
+            qpPreview.setText(asset.fileExtension().toUpperCase(Locale.ROOT));
+        }
+    }
+
     /** Starts/stops the selected-model flipbook (plan A) for the current selection. */
     private void updateFlipbook() {
         if (flipbook == null) return;
@@ -1551,9 +1777,14 @@ public final class MainWindow extends JFrame {
     /** Repaints only the selected card when a flipbook frame advances. */
     private void repaintSelectedCell() {
         int index = assetList.getSelectedIndex();
-        if (index < 0) return;
-        java.awt.Rectangle bounds = assetList.getCellBounds(index, index);
-        if (bounds != null) assetList.repaint(bounds);
+        if (index >= 0) {
+            java.awt.Rectangle bounds = assetList.getCellBounds(index, index);
+            if (bounds != null) assetList.repaint(bounds);
+        }
+        if (quickPreviewPanel != null && quickPreviewPanel.isVisible()) {
+            List<ModelAsset> sel = selectedAssets();
+            if (!sel.isEmpty()) updateQuickPreviewImage(sel.get(0));
+        }
     }
 
     /** Opens a model in its own viewer window; cascadeIndex offsets the window so
@@ -1760,6 +1991,7 @@ public final class MainWindow extends JFrame {
         filtersWrapper.add(new JPanel()); // right-side spacer
 
         // Tag buttons inside a scroll pane that wraps with viewport width
+        tagButtonsPanel.setLayout(new BoxLayout(tagButtonsPanel, BoxLayout.Y_AXIS));
         tagButtonsPanel.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
         tagButtonsPanel.setToolTipText(get("main.matchesTags"));
         JScrollPane tagScroll = new JScrollPane(tagButtonsPanel,
@@ -1844,7 +2076,15 @@ public final class MainWindow extends JFrame {
         }
     }
 
-    /** Rebuilds the tag filter buttons from all scanned assets. */
+    /** Group prefix of a "Category:Name" tag, or "" for ungrouped tags. */
+    private static String tagGroupOf(String tag) {
+        int a = tag.indexOf(':');
+        int b = tag.indexOf('：');
+        int sep = a < 0 ? b : (b < 0 ? a : Math.min(a, b));
+        return sep > 0 ? tag.substring(0, sep).trim() : "";
+    }
+
+    /** Rebuilds the tag filter buttons from all scanned assets, grouped by "Category:" prefix. */
     private void rebuildTagButtons() {
         // Collect all unique visible tags (readme + custom)
         java.util.TreeSet<String> allTags = new java.util.TreeSet<>(String.CASE_INSENSITIVE_ORDER);
@@ -1858,8 +2098,37 @@ public final class MainWindow extends JFrame {
             tagStates.putIfAbsent(tag, TagState.NEUTRAL);
         }
 
-        tagButtonsPanel.removeAll();
+        // Group by "Category:" prefix; ungrouped tags form the first section.
+        java.util.Map<String, List<String>> groups = new java.util.TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        List<String> ungrouped = new ArrayList<>();
         for (String tag : allTags) {
+            String group = tagGroupOf(tag);
+            if (group.isEmpty()) ungrouped.add(tag);
+            else groups.computeIfAbsent(group, g -> new ArrayList<>()).add(tag);
+        }
+
+        tagButtonsPanel.removeAll();
+        addTagGroupRow(ungrouped.isEmpty() ? null : get("main.tagGroup.general"), ungrouped);
+        for (var entry : groups.entrySet()) {
+            addTagGroupRow(entry.getKey(), entry.getValue());
+        }
+        tagButtonsPanel.revalidate();
+        tagButtonsPanel.repaint();
+    }
+
+    /** One label + tri-state-buttons row inside the tag filter panel. */
+    private void addTagGroupRow(String groupLabel, List<String> tags) {
+        if (tags.isEmpty()) return;
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        if (groupLabel != null) {
+            JLabel header = new JLabel(groupLabel);
+            header.setFont(header.getFont().deriveFont(Font.BOLD, 11f));
+            header.setForeground(new Color(110, 118, 128));
+            header.setPreferredSize(new Dimension(72, header.getPreferredSize().height));
+            row.add(header);
+        }
+        for (String tag : tags) {
             JButton btn = new JButton(formatTagButtonLabel(tag, tagStates.get(tag)));
             btn.setFont(btn.getFont().deriveFont(Font.PLAIN, 11f));
             btn.setFocusPainted(false);
@@ -1873,10 +2142,9 @@ public final class MainWindow extends JFrame {
                 applyFilter();
             });
             btn.setToolTipText(get("main.tagCycleHint"));
-            tagButtonsPanel.add(btn);
+            row.add(btn);
         }
-        tagButtonsPanel.revalidate();
-        tagButtonsPanel.repaint();
+        tagButtonsPanel.add(row);
     }
 
     private static String formatTagButtonLabel(String tag, TagState state) {
@@ -1956,6 +2224,15 @@ public final class MainWindow extends JFrame {
             return get("main.na");
         }
         return NumberFormat.getIntegerInstance().format(polygonCount);
+    }
+
+    private static String formatByteSize(long bytes) {
+        if (bytes >= 1_000_000) {
+            return String.format("%.1f MB", bytes / 1_000_000.0);
+        } else if (bytes >= 1_000) {
+            return String.format("%.1f KB", bytes / 1_000.0);
+        }
+        return bytes + " B";
     }
 
     private final class AssetCellRenderer extends DefaultListCellRenderer {
@@ -2116,17 +2393,122 @@ public final class MainWindow extends JFrame {
         }
 
         private String formatFileSize(long bytes) {
-            if (bytes >= 1_000_000) {
-                return String.format("%.1f MB", bytes / 1_000_000.0);
-            } else if (bytes >= 1_000) {
-                return String.format("%.1f KB", bytes / 1_000.0);
-            } else {
-                return bytes + " B";
-            }
+            return formatByteSize(bytes);
         }
 
         private static String escapeHtml(String s) {
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+        }
+    }
+
+    /**
+     * Compact single-row renderer for list view: small thumbnail on the left,
+     * name + path/tags stacked in the middle, fixed metric columns on the right.
+     */
+    private final class ListRowRenderer extends DefaultListCellRenderer {
+        private static final int THUMB = 44;
+        private final JPanel row = new JPanel(new BorderLayout(10, 0));
+        private final ShimmerPreviewLabel thumb = new ShimmerPreviewLabel();
+        private final JLabel nameLabel = new JLabel();
+        private final JLabel subLabel = new JLabel();
+        private final JLabel formatLabel = new JLabel();
+        private final JLabel sizeLabel = new JLabel();
+        private final JLabel polyLabel = new JLabel();
+        private final JLabel texLabel = new JLabel();
+        private final JLabel starLabel = new JLabel();
+
+        private ListRowRenderer() {
+            row.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+            thumb.setOpaque(true);
+            thumb.setBackground(new Color(24, 28, 34));
+            thumb.setForeground(new Color(228, 233, 239));
+            thumb.setFont(thumb.getFont().deriveFont(Font.BOLD, 10f));
+            thumb.setPreferredSize(new Dimension(THUMB, THUMB));
+            thumb.setHorizontalAlignment(JLabel.CENTER);
+            row.add(thumb, BorderLayout.WEST);
+
+            JPanel text = new JPanel();
+            text.setLayout(new BoxLayout(text, BoxLayout.Y_AXIS));
+            text.setOpaque(false);
+            nameLabel.setFont(nameLabel.getFont().deriveFont(Font.BOLD, 12f));
+            nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            subLabel.setFont(subLabel.getFont().deriveFont(10f));
+            subLabel.setForeground(new Color(120, 130, 140));
+            subLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            text.add(nameLabel);
+            text.add(Box.createVerticalStrut(2));
+            text.add(subLabel);
+            row.add(text, BorderLayout.CENTER);
+
+            JPanel columns = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
+            columns.setOpaque(false);
+            formatLabel.setPreferredSize(new Dimension(40, 16));
+            sizeLabel.setPreferredSize(new Dimension(64, 16));
+            polyLabel.setPreferredSize(new Dimension(84, 16));
+            texLabel.setPreferredSize(new Dimension(64, 16));
+            Font small = columns.getFont().deriveFont(Font.PLAIN, 11f);
+            for (JLabel l : new JLabel[] { formatLabel, sizeLabel, polyLabel, texLabel, starLabel }) {
+                l.setFont(small);
+                columns.add(l);
+            }
+            row.add(columns, BorderLayout.EAST);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(
+                JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+            if (!(value instanceof ModelAsset asset)) return row;
+
+            String displayName = asset.fileName();
+            String mName = asset.metadata().modelName();
+            if (!mName.isEmpty() && !mName.equalsIgnoreCase(
+                    displayName.replaceFirst("\\.[^.]+$", ""))) {
+                displayName += " (" + mName + ")";
+            }
+            nameLabel.setText(displayName);
+            nameLabel.setForeground(isSelected ? new Color(20, 40, 80) : new Color(36, 42, 50));
+
+            List<String> tags = getEffectiveTags(asset);
+            String folder = asset.path().getParent() != null
+                    ? asset.path().getParent().getFileName().toString() : "";
+            subLabel.setText(tags.isEmpty() ? folder : folder + "  ·  " + String.join(", ", tags));
+
+            formatLabel.setText(asset.fileExtension().toUpperCase(Locale.ROOT));
+            sizeLabel.setText(formatByteSize(asset.fileSizeBytes()));
+            ModelMetadata meta = asset.metadata();
+            polyLabel.setText(meta.hasKnownPolygonCount()
+                    ? NumberFormat.getIntegerInstance().format(meta.polygonCount()) + " " + get("main.poly")
+                    : get("main.polyNA"));
+            TextureHealth th = asset.texHealth();
+            if (th == null) {
+                texLabel.setText("—");
+                texLabel.setForeground(new Color(120, 130, 140));
+            } else {
+                texLabel.setText(th.found() + "/" + th.total());
+                texLabel.setForeground(th.missing() > 0 ? new Color(196, 68, 48) : new Color(70, 140, 70));
+            }
+            starLabel.setText(settings.isFavorite(asset.path().toAbsolutePath().toString()) ? "★" : "");
+
+            if (meta.isHd()) {
+                thumb.setUnsupported(THUMB);
+                thumb.setText(get("main.hdUnsupportedBadge"));
+            } else {
+                BufferedImage img = flipbook != null ? flipbook.currentFrame(asset.path()) : null;
+                if (img == null && thumbnailRenderer != null) {
+                    img = thumbnailRenderer.getThumbnail(asset.path());
+                }
+                if (img != null) {
+                    thumb.setThumbnail(img, THUMB);
+                    thumb.setText("");
+                } else {
+                    thumb.setThumbnail(null, THUMB);
+                    thumb.setText(asset.fileExtension().toUpperCase(Locale.ROOT));
+                }
+            }
+
+            row.setOpaque(true);
+            row.setBackground(isSelected ? new Color(231, 240, 255) : new Color(249, 250, 252));
+            return row;
         }
     }
 
