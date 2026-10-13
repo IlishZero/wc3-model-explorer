@@ -17,11 +17,16 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+
+import com.hiveworkshop.model.GeosetTexData;
+import com.hiveworkshop.model.TextureHealth;
 
 /**
  * Singleton that provides texture lookup across:
@@ -314,6 +319,50 @@ public final class GameDataSource {
             }
         }
         return "MISSING";
+    }
+
+    /**
+     * Counts a model's unique texture references and how many fail to resolve.
+     * Used at scan time for the dependency-health badge/filter. Returns
+     * {@code null} when the model references no textures at all.
+     */
+    public TextureHealth summarizeTextureHealth(GeosetTexData[] texData,
+                                                Path modelDir, Path rootDir) {
+        if (texData == null || texData.length == 0) return null;
+        Set<String> seen = new HashSet<>();
+        int total = 0;
+        int missing = 0;
+        for (GeosetTexData td : texData) {
+            if (td == null) continue;
+            if (td.layers() != null && !td.layers().isEmpty()) {
+                for (GeosetTexData.LayerTexData layer : td.layers()) {
+                    int[] counted = accumulate(layer.texturePath(), layer.replaceableId(),
+                            modelDir, rootDir, seen);
+                    total += counted[0];
+                    missing += counted[1];
+                }
+            } else {
+                int[] counted = accumulate(td.texturePath(), td.replaceableId(),
+                        modelDir, rootDir, seen);
+                total += counted[0];
+                missing += counted[1];
+            }
+        }
+        return total == 0 ? null : new TextureHealth(total, missing);
+    }
+
+    /** @return {1,1} for a missing reference, {1,0} for a resolvable one, {0,0} when skipped. */
+    private int[] accumulate(String texturePath, int replaceableId,
+                             Path modelDir, Path rootDir, Set<String> seen) {
+        if (replaceableId == 0 && (texturePath == null || texturePath.isBlank())) {
+            return new int[] { 0, 0 }; // blank slot, not a texture reference
+        }
+        if (!seen.add(replaceableId + "|" + texturePath)) {
+            return new int[] { 0, 0 }; // same texture referenced by several geosets
+        }
+        boolean lost = "MISSING".equals(
+                resolveTextureSource(texturePath, replaceableId, modelDir, rootDir));
+        return lost ? new int[] { 1, 1 } : new int[] { 1, 0 };
     }
 
     /**

@@ -3,13 +3,17 @@ package com.hiveworkshop.model;
 import java.nio.file.Path;
 import java.util.List;
 
-public record ModelAsset(Path path, long fileSizeBytes, ModelMetadata metadata, String parseError, List<String> tags) {
+public record ModelAsset(Path path, long fileSizeBytes, ModelMetadata metadata, String parseError, List<String> tags, TextureHealth texHealth) {
     public ModelAsset(Path path, long fileSizeBytes, ModelMetadata metadata) {
-        this(path, fileSizeBytes, metadata, null, List.of());
+        this(path, fileSizeBytes, metadata, null, List.of(), null);
     }
 
     public ModelAsset(Path path, long fileSizeBytes, ModelMetadata metadata, String parseError) {
-        this(path, fileSizeBytes, metadata, parseError, List.of());
+        this(path, fileSizeBytes, metadata, parseError, List.of(), null);
+    }
+
+    public ModelAsset(Path path, long fileSizeBytes, ModelMetadata metadata, String parseError, List<String> tags) {
+        this(path, fileSizeBytes, metadata, parseError, tags, null);
     }
 
     public ModelAsset {

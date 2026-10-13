@@ -99,9 +99,14 @@ public final class ModelScanner {
         modelFiles.parallelStream().forEach(path -> {
             if (cancelled != null && cancelled.get()) return;
             try {
-                ModelMetadata meta = ModelMetadataExtractor.extract(path);
+                ReterasParsedModel parsed = ReterasModelParser.parse(path);
+                ModelMetadata meta = parsed.metadata();
+                // HD models are gated before rendering; health stays "unknown" for them.
+                TextureHealth health = parsed.isHd() ? null
+                        : GameDataSource.getInstance().summarizeTextureHealth(
+                                parsed.texData(), path.getParent(), normalizedRoot);
                 List<String> tags = parseTags ? resolveTagsCached(path, tagCache) : List.of();
-                results.add(new ModelAsset(path, Files.size(path), meta, null, tags));
+                results.add(new ModelAsset(path, Files.size(path), meta, null, tags, health));
             } catch (Exception ex) {
                 // Keep the file in results with an error message
                 try {
