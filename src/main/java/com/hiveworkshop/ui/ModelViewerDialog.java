@@ -993,6 +993,11 @@ public final class ModelViewerDialog extends JFrame {
                 ? nfmt.format(meta.polygonCount()) : get("main.na");
 
         String mName = meta.modelName();
+        TextureHealth texHealth = GameDataSource.getInstance().summarizeTextureHealth(
+                parsedModel.texData(), asset.path().getParent(), scanRoot);
+        String texHealthText = texHealth == null ? get("main.na")
+                : texHealth.found() + "/" + texHealth.total() + (texHealth.missing() > 0
+                        ? " (" + fmt("viewer.info.texMissing", texHealth.missing()) + ")" : "");
         String[][] rows = {
                 {get("viewer.info.file"), asset.fileName()},
                 {get("viewer.info.modelName"), mName.isEmpty() ? get("main.na") : mName},
@@ -1004,6 +1009,7 @@ public final class ModelViewerDialog extends JFrame {
                 {get("viewer.info.geosets"), String.valueOf(animData.geosets().size())},
                 {get("viewer.info.sequences"), String.valueOf(animData.sequences().size())},
                 {get("viewer.info.textures"), String.valueOf(parsedModel.texData().length)},
+                {get("viewer.info.texResolved"), texHealthText},
                 {get("viewer.info.boundingRadius"), String.format("%.2f", mesh.radius())},
         };
 

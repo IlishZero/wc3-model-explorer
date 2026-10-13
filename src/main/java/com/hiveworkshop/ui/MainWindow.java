@@ -70,6 +70,7 @@ import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.awt.image.BufferedImage;
+import javax.imageio.ImageIO;
 import java.awt.geom.RoundRectangle2D;
 import java.io.File;
 import java.io.IOException;
@@ -114,6 +115,8 @@ public final class MainWindow extends JFrame {
     private final JComboBox<SortOrder> sortCombo = new JComboBox<>(SortOrder.values());
     private final JToggleButton advancedFiltersToggle = new JToggleButton(get("main.advancedFilters"));
     private final JButton exportCsvButton = new JButton(get("main.exportCsv"));
+    private final JComboBox<TextureHealthFilter> texHealthCombo = new JComboBox<>(TextureHealthFilter.values());
+    private final JPanel chipsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
     private final JPanel advancedFiltersPanel = new JPanel(new BorderLayout());
     private final JTabbedPane advancedFiltersTabs = new JTabbedPane(JTabbedPane.TOP);
     private final JPanel filtersGridPanel = new JPanel(new GridLayout(0, 4, 8, 6));
@@ -224,6 +227,8 @@ public final class MainWindow extends JFrame {
         filterControls.add(advancedFiltersToggle);
         filterControls.add(exportCsvButton);
         filterRow.add(filterControls, BorderLayout.EAST);
+        chipsPanel.setVisible(false);
+        filterRow.add(chipsPanel, BorderLayout.SOUTH);
         topPanel.add(filterRow, BorderLayout.SOUTH);
         buildAdvancedFiltersPanel();
         advancedFiltersPanel.setVisible(false);
@@ -278,6 +283,7 @@ public final class MainWindow extends JFrame {
         recentButton.addActionListener(event -> showRecentFoldersPopup());
         favoritesToggle.addActionListener(event -> applyFilter());
         exportCsvButton.addActionListener(event -> exportCsv());
+        texHealthCombo.addActionListener(event -> applyFilter());
         assetList.addListSelectionListener(event -> {
             if (!event.getValueIsAdjusting()) updateFlipbook();
         });
@@ -521,15 +527,94 @@ public final class MainWindow extends JFrame {
                         || asset.fileName().toLowerCase(Locale.ROOT).contains(needle)
                         || asset.metadata().modelName().toLowerCase(Locale.ROOT).contains(needle))
                 .filter(portraitFilter::allows)
-                .filter(asset -> asset.metadata().hasAnimationContaining(animationNeedle))
+                .filter(asset -> matchesAllAnimations(asset.metadata(), animationNeedle))
                 .filter(asset -> asset.metadata().hasTextureContaining(textureNeedle))
+                .filter(selectedTexHealth()::allows)
                 .filter(this::matchesTagFilter)
                 .filter(asset -> polygonRangeMatches(asset, minPolygons, maxPolygons))
                 .filter(asset -> minSizeBytes == null || asset.fileSizeBytes() >= minSizeBytes)
                 .filter(asset -> maxSizeBytes == null || asset.fileSizeBytes() <= maxSizeBytes)
                 .sorted(currentSortOrder().comparator())
                 .collect(Collectors.toList());
+        rebuildFilterChips();
         renderAssetsProgressively(filtered);
+    }
+
+    private TextureHealthFilter selectedTexHealth() {
+        TextureHealthFilter selected = (TextureHealthFilter) texHealthCombo.getSelectedItem();
+        return selected != null ? selected : TextureHealthFilter.ALL;
+    }
+
+    /**
+     * Comma/space-separated animation filter: every token must match at least
+     * one animation name (e.g. "Walk, Attack" requires both).
+     */
+    private static boolean matchesAllAnimations(ModelMetadata meta, String needle) {
+        if (needle.isEmpty()) return true;
+        for (String token : needle.split("[,，;；、\\s]+")) {
+            if (!token.isEmpty() && !meta.hasAnimationContaining(token)) return false;
+        }
+        return true;
+    }
+
+    // ── Active-filter chips ──────────────────────────────────────────────
+
+    /** Rebuilds the removable chips under the toolbar from the current filter state. */
+    private void rebuildFilterChips() {
+        chipsPanel.removeAll();
+        addTextChip(get("main.search"), searchField);
+        addTextChip(get("main.animationName"), animationFilterField);
+        addTextChip(get("main.texturePath"), textureFilterField);
+        addTextChip(get("main.minPolygons"), minPolygonsField);
+        addTextChip(get("main.maxPolygons"), maxPolygonsField);
+        addTextChip(get("main.minSizeKb"), minSizeKbField);
+        addTextChip(get("main.maxSizeKb"), maxSizeKbField);
+
+        PortraitFilter portrait = (PortraitFilter) portraitFilterCombo.getSelectedItem();
+        if (portrait != null && portrait != PortraitFilter.MODELS_ONLY) {
+            addChip(get("portrait.label") + ": " + portrait,
+                    () -> portraitFilterCombo.setSelectedItem(PortraitFilter.MODELS_ONLY));
+        }
+        TextureHealthFilter health = selectedTexHealth();
+        if (health != TextureHealthFilter.ALL) {
+            addChip(get("main.texHealth") + ": " + health,
+                    () -> texHealthCombo.setSelectedItem(TextureHealthFilter.ALL));
+        }
+        if (favoritesToggle.isSelected()) {
+            addChip(get("main.favorites"), () -> favoritesToggle.setSelected(false));
+        }
+        for (var entry : tagStates.entrySet()) {
+            if (entry.getValue() == TagState.NEUTRAL) continue;
+            String tag = entry.getKey();
+            addChip(formatTagButtonLabel(tag, entry.getValue()), () -> {
+                tagStates.put(tag, TagState.NEUTRAL);
+                rebuildTagButtons();
+            });
+        }
+        chipsPanel.setVisible(chipsPanel.getComponentCount() > 0);
+        chipsPanel.revalidate();
+        chipsPanel.repaint();
+    }
+
+    private void addTextChip(String label, JTextField field) {
+        String value = field.getText().trim();
+        if (!value.isEmpty()) {
+            addChip(label + ": " + value, () -> field.setText(""));
+        }
+    }
+
+    /** One removable chip. The action mutates the control; filtering re-runs after it. */
+    private void addChip(String label, Runnable reset) {
+        JButton chip = new JButton(label + "  ×");
+        chip.setFont(chip.getFont().deriveFont(Font.PLAIN, 11f));
+        chip.setFocusPainted(false);
+        chip.setMargin(new java.awt.Insets(2, 8, 2, 8));
+        chip.setToolTipText(get("main.chipRemoveHint"));
+        chip.addActionListener(e -> {
+            reset.run();
+            applyFilter();
+        });
+        chipsPanel.add(chip);
     }
 
     private SortOrder currentSortOrder() {
@@ -577,6 +662,11 @@ public final class MainWindow extends JFrame {
         portraitFilterCombo.removeAllItems();
         for (PortraitFilter p : PortraitFilter.values()) portraitFilterCombo.addItem(p);
         portraitFilterCombo.setSelectedItem(selectedPortrait);
+
+        TextureHealthFilter selectedHealth = selectedTexHealth();
+        texHealthCombo.removeAllItems();
+        for (TextureHealthFilter t : TextureHealthFilter.values()) texHealthCombo.addItem(t);
+        texHealthCombo.setSelectedItem(selectedHealth);
 
         ThumbnailSize selectedSize = (ThumbnailSize) thumbnailSizeCombo.getSelectedItem();
         thumbnailSizeCombo.removeAllItems();
@@ -644,6 +734,12 @@ public final class MainWindow extends JFrame {
         maxPolygonsField.setText(settings.uiString("filterMaxPoly", ""));
         minSizeKbField.setText(settings.uiString("filterMinSizeKb", ""));
         maxSizeKbField.setText(settings.uiString("filterMaxSizeKb", ""));
+        try {
+            texHealthCombo.setSelectedItem(TextureHealthFilter.valueOf(
+                    settings.uiString("filterTexHealth", TextureHealthFilter.ALL.name())));
+        } catch (IllegalArgumentException ex) {
+            texHealthCombo.setSelectedItem(TextureHealthFilter.ALL);
+        }
         // Reveal the advanced panel if any advanced filter was restored, so the
         // active filtering is visible to the user rather than silently applied.
         boolean anyAdvanced = !animationFilterField.getText().isEmpty()
@@ -651,7 +747,8 @@ public final class MainWindow extends JFrame {
                 || !minPolygonsField.getText().isEmpty()
                 || !maxPolygonsField.getText().isEmpty()
                 || !minSizeKbField.getText().isEmpty()
-                || !maxSizeKbField.getText().isEmpty();
+                || !maxSizeKbField.getText().isEmpty()
+                || selectedTexHealth() != TextureHealthFilter.ALL;
         if (anyAdvanced) {
             advancedFiltersToggle.setSelected(true);
             advancedFiltersPanel.setVisible(true);
@@ -675,6 +772,7 @@ public final class MainWindow extends JFrame {
         settings.setUiPref("filterMaxPoly", maxPolygonsField.getText());
         settings.setUiPref("filterMinSizeKb", minSizeKbField.getText());
         settings.setUiPref("filterMaxSizeKb", maxSizeKbField.getText());
+        settings.setUiPref("filterTexHealth", selectedTexHealth().name());
         settings.save();
     }
 
@@ -1255,7 +1353,7 @@ public final class MainWindow extends JFrame {
         final Path scanRoot = currentScanRoot();
 
         new Thread(() -> {
-            int models = 0, textures = 0, skipped = 0;
+            int models = 0, textures = 0, extracted = 0, skipped = 0;
             List<String> errors = new ArrayList<>();
             com.hiveworkshop.parser.GameDataSource gds = com.hiveworkshop.parser.GameDataSource.getInstance();
             for (ModelAsset asset : assets) {
@@ -1271,20 +1369,23 @@ public final class MainWindow extends JFrame {
                     Path modelDir = modelSrc.getParent();
                     java.util.Set<String> seen = new java.util.HashSet<>();
                     for (com.hiveworkshop.model.GeosetTexData td : pm.texData()) {
-                        if (!td.layers().isEmpty()) {
-                            for (var layer : td.layers()) {
+                        List<com.hiveworkshop.model.GeosetTexData.LayerTexData> layers = td.layers();
+                        if (layers != null && !layers.isEmpty()) {
+                            for (var layer : layers) {
                                 switch (copyOneTexture(gds, layer.texturePath(), layer.replaceableId(),
                                         modelDir, scanRoot, dest, seen)) {
-                                    case 1 -> textures++;
-                                    case 0 -> skipped++;
+                                    case COPIED -> textures++;
+                                    case EXTRACTED -> extracted++;
+                                    case SKIPPED -> skipped++;
                                     default -> { /* duplicate or blank — ignore */ }
                                 }
                             }
                         } else {
                             switch (copyOneTexture(gds, td.texturePath(), td.replaceableId(),
                                     modelDir, scanRoot, dest, seen)) {
-                                case 1 -> textures++;
-                                case 0 -> skipped++;
+                                case COPIED -> textures++;
+                                case EXTRACTED -> extracted++;
+                                case SKIPPED -> skipped++;
                                 default -> { }
                             }
                         }
@@ -1293,9 +1394,9 @@ public final class MainWindow extends JFrame {
                     errors.add(asset.fileName() + ": " + ex.getMessage());
                 }
             }
-            final int fModels = models, fTex = textures, fSkip = skipped;
+            final int fModels = models, fTex = textures, fExtracted = extracted, fSkip = skipped;
             SwingUtilities.invokeLater(() -> {
-                String msg = fmt("main.copyWithTextures.done", fModels, fTex, fSkip);
+                String msg = fmt("main.copyWithTextures.done", fModels, fTex, fExtracted, fSkip);
                 if (!errors.isEmpty()) msg += System.lineSeparator() + System.lineSeparator()
                         + String.join(System.lineSeparator(), errors);
                 JOptionPane.showMessageDialog(this, msg, get("main.copyWithTextures"),
@@ -1304,24 +1405,42 @@ public final class MainWindow extends JFrame {
         }, "CopyWithTextures").start();
     }
 
+    private enum CopyOutcome { COPIED, EXTRACTED, SKIPPED, IGNORED }
+
     /**
-     * Copies a single texture reference to the destination, preserving its relative path.
-     * @return 1 if copied, 0 if skipped (archive/replaceable/missing), -1 if blank or duplicate.
+     * Copies a single texture reference to the destination, preserving its relative
+     * path. Loose files are copied as-is; textures living inside CASC/MPQ/map
+     * archives are decoded through the data source and written as PNG files.
      */
-    private static int copyOneTexture(com.hiveworkshop.parser.GameDataSource gds, String texPath,
+    private static CopyOutcome copyOneTexture(com.hiveworkshop.parser.GameDataSource gds, String texPath,
             int replaceableId, Path modelDir, Path scanRoot, Path dest, java.util.Set<String> seen) {
-        if (texPath == null || texPath.isBlank() || replaceableId > 0) return -1;
-        if (!seen.add(texPath)) return -1;
-        Path texSrc = gds.resolveDiskFile(texPath, modelDir, scanRoot);
-        if (texSrc == null) return 0; // inside an archive or missing — skip per spec
+        if (texPath == null || texPath.isBlank() || replaceableId > 0) return CopyOutcome.IGNORED;
+        if (!seen.add(texPath)) return CopyOutcome.IGNORED;
         try {
             Path texDest = dest.resolve(texPath.replace('\\', '/'));
+            Path texSrc = gds.resolveDiskFile(texPath, modelDir, scanRoot);
+            if (texSrc != null) {
+                if (texDest.getParent() != null) java.nio.file.Files.createDirectories(texDest.getParent());
+                java.nio.file.Files.copy(texSrc, texDest, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                return CopyOutcome.COPIED;
+            }
+            BufferedImage img = gds.loadTexture(texPath, modelDir, scanRoot);
+            if (img == null) return CopyOutcome.SKIPPED; // truly missing
+            texDest = dest.resolve(pngName(texPath));
             if (texDest.getParent() != null) java.nio.file.Files.createDirectories(texDest.getParent());
-            java.nio.file.Files.copy(texSrc, texDest, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            return 1;
+            ImageIO.write(img, "png", texDest.toFile());
+            return CopyOutcome.EXTRACTED;
         } catch (Exception ex) {
-            return 0;
+            return CopyOutcome.SKIPPED;
         }
+    }
+
+    /** Turns an archived texture reference ("Textures\Foo.blp") into a PNG-relative path. */
+    private static String pngName(String texPath) {
+        String rel = texPath.replace('\\', '/');
+        int dot = rel.lastIndexOf('.');
+        int slash = rel.lastIndexOf('/');
+        return (dot > slash ? rel.substring(0, dot) : rel) + ".png";
     }
 
     private List<ModelAsset> selectedAssets() {
@@ -1622,11 +1741,14 @@ public final class MainWindow extends JFrame {
         JPanel portraitPanel = new JPanel(new BorderLayout(4, 4));
         portraitPanel.add(new JLabel(get("portrait.label")), BorderLayout.NORTH);
         portraitPanel.add(portraitFilterCombo, BorderLayout.CENTER);
-        // Row 1: animation, texture, portrait
+        // Row 1: animation, texture, portrait, texture health
         filtersGridPanel.add(labeledField(get("main.animationName"), animationFilterField));
         filtersGridPanel.add(labeledField(get("main.texturePath"), textureFilterField));
         filtersGridPanel.add(portraitPanel);
-        filtersGridPanel.add(new JPanel()); // filler
+        JPanel texHealthPanel = new JPanel(new BorderLayout(4, 4));
+        texHealthPanel.add(new JLabel(get("main.texHealth")), BorderLayout.NORTH);
+        texHealthPanel.add(texHealthCombo, BorderLayout.CENTER);
+        filtersGridPanel.add(texHealthPanel);
         // Row 2: polygon range & size range
         filtersGridPanel.add(labeledField(get("main.minPolygons"), minPolygonsField));
         filtersGridPanel.add(labeledField(get("main.maxPolygons"), maxPolygonsField));
@@ -1945,6 +2067,9 @@ public final class MainWindow extends JFrame {
                         previewLabel.setText(asset.fileExtension().toUpperCase(Locale.ROOT));
                     }
                 }
+                TextureHealth health = asset.texHealth();
+                previewLabel.setBadges(asset.fileExtension().toUpperCase(Locale.ROOT),
+                        health != null ? health.missing() : 0);
 
                 ModelMetadata meta = asset.metadata();
                 NumberFormat nfmt = NumberFormat.getIntegerInstance();
@@ -1965,6 +2090,13 @@ public final class MainWindow extends JFrame {
                             .append(fmt("main.tooltip.bones", nfmt.format(meta.boneCount()))).append("<br>")
                             .append(fmt("main.tooltip.sequences", nfmt.format(meta.sequenceCount()))).append("<br>")
                             .append(fmt("main.tooltip.size", formatFileSize(asset.fileSizeBytes()))).append("<br>");
+                    TextureHealth th = asset.texHealth();
+                    if (th != null) {
+                        if (th.missing() > 0) sb.append("<font color='#c05040'>");
+                        sb.append(fmt("main.tooltip.texHealth", th.found(), th.total()));
+                        if (th.missing() > 0) sb.append("</font>");
+                        sb.append("<br>");
+                    }
                     if (!visibleTags.isEmpty()) {
                         sb.append("<font color='#5082b4'>")
                                 .append(fmt("main.tooltip.tags", String.join(", ", visibleTags)))
@@ -2009,11 +2141,15 @@ public final class MainWindow extends JFrame {
         private static final Color SPINNER_COLOR = new Color(100, 140, 200);
         private static final Color PREVIEW_FRAME = new Color(255, 255, 255, 24);
         private static final Color UNSUPPORTED_BG = new Color(36, 38, 44);
+        private static final Color FORMAT_BADGE_BG = new Color(20, 24, 30, 170);
+        private static final Color MISSING_BADGE_BG = new Color(196, 68, 48, 215);
         private static final int IMAGE_OVERSCAN = 2;
         private BufferedImage scaledThumb;
         private BufferedImage lastSource;
         private int lastSize;
         private boolean unsupported;
+        private String formatBadge;
+        private int missingTex;
 
         void setThumbnail(BufferedImage thumb, int displaySize) {
             unsupported = false;
@@ -2029,6 +2165,13 @@ public final class MainWindow extends JFrame {
                 lastSource = null;
                 lastSize = displaySize;
             }
+            repaint();
+        }
+
+        /** Corner badges: file format (top-right, always) and missing-texture count (top-left, when > 0). */
+        void setBadges(String format, int missingTextures) {
+            formatBadge = format;
+            missingTex = missingTextures;
             repaint();
         }
 
@@ -2115,7 +2258,27 @@ public final class MainWindow extends JFrame {
             }
             g2.setColor(PREVIEW_FRAME);
             g2.drawRoundRect(0, 0, w - 1, h - 1, 18, 18);
+
+            g2.setFont(getFont().deriveFont(Font.BOLD, 9.5f));
+            if (formatBadge != null && !formatBadge.isEmpty()) {
+                drawBadge(g2, formatBadge, w, 6, FORMAT_BADGE_BG);
+            }
+            if (missingTex > 0) {
+                drawBadge(g2, Messages.fmt("main.badge.missingTex", missingTex), w, 24, MISSING_BADGE_BG);
+            }
             g2.dispose();
+        }
+
+        private void drawBadge(Graphics2D g2, String text, int width, int y, Color bg) {
+            java.awt.FontMetrics fm = g2.getFontMetrics();
+            int pad = 5;
+            int bw = fm.stringWidth(text) + pad * 2;
+            int bh = fm.getHeight() + 2;
+            int x = width - bw - 6;
+            g2.setColor(bg);
+            g2.fillRoundRect(x, y, bw, bh, 8, 8);
+            g2.setColor(Color.WHITE);
+            g2.drawString(text, x + pad, y + fm.getAscent() + 1);
         }
 
         private static BufferedImage scaleThumbnail(BufferedImage thumb, int displaySize) {
