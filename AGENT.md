@@ -11,11 +11,13 @@ The application has two main goals:
 
 ## Current State
 
-The project is release-ready (v1.0.0). It ships as a standalone executable via jpackage with a bundled JRE — no Java installation required.
+The project is at v1.5.0 and actively developed. It ships as a standalone executable via jpackage with a bundled JRE — no Java installation required.
 
 Current capabilities:
 
-- a Swing desktop shell (`MainWindow`) with directory scanning, search, sorting (name/size/folder), portrait filtering, advanced metadata filters, favorites, recent models, progressive list population, and thumbnail generation
+- a Swing desktop shell (`MainWindow`) with directory scanning, search, sorting (name/size/folder), portrait filtering, advanced metadata filters, favorites, recent folders, progressive list population, and thumbnail generation
+- a tag system: auto-extracted from `readme.html` (HiveWorkshop downloads) plus per-model custom tags, tri-state include/exclude filter buttons
+- a selected-card flipbook animation (`FlipbookManager`): 12 pre-rendered pose frames cycled on a Swing timer, paused on focus loss
 - a model viewer dialog (`ModelViewerDialog`) with a large OpenGL preview and tabs for animation, info, textures, materials, geosets, UV maps, and nodes
 - a custom OpenGL canvas (`GlPreviewCanvas`) built on `org.lwjgl.opengl.awt.AWTGLCanvas`
 - parsing and metadata extraction backed by code adapted from Retera Model Studio
@@ -23,8 +25,11 @@ Current capabilities:
 - map archive support (`.w3x` / `.w3m`) — both Reforged and pre-Reforged MPQ formats
 - ribbon emitter and particle emitter 2 rendering with per-sequence visibility
 - model camera view support
+- an editing suite (`edit/` package): MDX↔MDL conversion, manager dialogs for sequences/geosets/textures/materials/bones/keyframes, model slimming, texture health check, backup/restore — all writes go through `ModelFileService` (serialize → re-parse → count check → backup → write)
+- batch tools: CSV export of the filtered list, GIF/PNG-sequence animation export, copy-with-textures
 - persisted user settings in `%APPDATA%/wc3-model-explorer/settings.properties`
-- i18n support (English, French)
+- i18n support (English, French, Spanish, Russian, Simplified Chinese); OS locale auto-detected on first launch via `Main.SUPPORTED_LOCALES`
+- JUnit 5 tests under `src/test/` covering the editing services and viewer math
 
 ## Primary Source Layout
 
@@ -34,11 +39,15 @@ Current capabilities:
 - `src/main/java/com/hiveworkshop/ui/ModelViewerDialog.java`: model inspection dialog
 - `src/main/java/com/hiveworkshop/ui/GlPreviewCanvas.java`: OpenGL renderer and camera/input logic
 - `src/main/java/com/hiveworkshop/ui/ThumbnailRenderer.java`: background thumbnail rendering
-- `src/main/java/com/hiveworkshop/ui/SettingsDialog.java`: data source, theme, camera, and external program settings
+- `src/main/java/com/hiveworkshop/ui/FlipbookManager.java`: animated thumbnail for the selected card
+- `src/main/java/com/hiveworkshop/ui/SettingsDialog.java`: data source, theme, camera, tags, and external program settings
+- `src/main/java/com/hiveworkshop/edit/`: model editing services (conversion, writes, backups, exports)
+- `src/main/java/com/hiveworkshop/edit/ui/`: editing manager dialogs and write preview
 - `src/main/java/com/hiveworkshop/parser/`: scanning, parsing, metadata extraction, animation, settings, and texture data source logic
 - `src/main/java/com/hiveworkshop/model/`: immutable records and render data structures
 - `src/main/java/com/hiveworkshop/i18n/`: internationalization
-- `src/main/resources/i18n/`: message bundles (English, French)
+- `src/main/resources/i18n/`: message bundles (en default, fr, es, ru, zh_CN)
+- `src/test/java/`: JUnit 5 tests (`edit/` service tests, `ui/` viewer-math tests)
 - `src/main/resources/images/`: app icon and UI images
 - `src/main/resources/version.properties`: version injected by gradle
 - `libs/`: bundled jars used by the project
@@ -106,17 +115,23 @@ Notes:
 - sort by name, file size, or parent folder
 - portrait filtering
 - advanced filters for animation name, texture path, polygon count, and file size
+- tag filtering (tri-state include/exclude, auto-extracted + custom tags)
 - progressive thumbnail scheduling so the UI remains responsive
-- favorites and recent models tracking
-- right-click context menu: copy path/file, open file location, open in external program, toggle favorite, delete file
-- drag & drop models to external applications
+- favorites and recent folders tracking
+- right-click context menu: copy path/file, copy with textures, open in viewer, open file location, open in external program, tags, toggle favorite, delete file, and an Edit submenu (convert, manager dialogs, slimming, backup restore)
+- drag & drop both ways: models out to external applications, and OS files/folders/map archives in to scan or open
+- shell drop of `.mdx`/`.mdl` files opens them directly in the viewer
+- CSV export of the currently filtered list
 - team color selector for thumbnails
+- HD models show an "unsupported" badge instead of a thumbnail
 
 ### Model Viewer
 
 - orbit, pan, zoom, and reset camera controls
 - model camera view toggle (uses camera defined in the model file, mapped to orbit controls)
-- animation playback with sequence selection, speed control (0.1x–3x), looping, and recentering
+- animation playback with sequence selection, speed control (0.1x–3x, two-decimal input), looping, A/B loop range, frame stepping (`,`/`.` or Shift+arrows), and recentering
+- "None" sequence option shows the bind pose
+- animation export to GIF or PNG frame sequence (fps + scale, honors loop range)
 - 6 shading modes: solid, textured, lit, normals, geoset colors, bone count heat map
 - wireframe toggle
 - overlays for extent, grid, bones, helpers, attachments, ribbon emitters, particle emitters, collision shapes, and node names
@@ -159,12 +174,14 @@ Current settings include:
 - MPQ archive list
 - Swing look and feel
 - language
+- tag auto-parsing toggle and hidden-tag list
 - 3D background color
 - default viewer camera yaw and pitch
 - default animation used for thumbnail posing
 - external program launch entries
 - favorites list
-- recent models list
+- recent folders list
+- persisted window sizes/maximized state, main-window filter selections, and viewer control settings
 
 ## Guidance For Future Work
 
