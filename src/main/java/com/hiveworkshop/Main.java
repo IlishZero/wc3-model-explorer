@@ -11,7 +11,7 @@ import java.util.Locale;
 
 public final class Main {
 
-    private static final String[] SUPPORTED_LOCALES = { "en", "fr", "zh-CN" };
+    private static final String[] SUPPORTED_LOCALES = { "en", "fr", "es", "ru", "zh-CN" };
 
     private Main() {
     }
