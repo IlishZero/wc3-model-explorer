@@ -22,6 +22,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -61,7 +62,18 @@ public final class ThumbnailRenderer {
     private final AWTGLCanvas canvas;
     private final LinkedBlockingQueue<ThumbnailRequest> queue = new LinkedBlockingQueue<>();
     private final AtomicInteger generation = new AtomicInteger(0);
-    private final ConcurrentHashMap<Path, BufferedImage> cache = new ConcurrentHashMap<>();
+    // Memory cache is bounded (guardrail): a big library scrolled end to end
+    // would otherwise pile up ~256KB per model in the heap.
+    private final Map<Path, BufferedImage> cache = newLruCache(400);
+
+    /** Bounded access-order cache shared by EDT reads and GL-thread writes. */
+    static Map<Path, BufferedImage> newLruCache(int maxEntries) {
+        return java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(64, 0.75f, true) {
+            @Override protected boolean removeEldestEntry(java.util.Map.Entry<Path, BufferedImage> eldest) {
+                return size() > maxEntries;
+            }
+        });
+    }
 
     private volatile boolean running = true;
 
@@ -125,8 +137,17 @@ public final class ThumbnailRenderer {
 
     /** Queue a thumbnail request. Callback is invoked on the EDT. */
     public void request(ModelAsset asset, Path rootDir, Consumer<BufferedImage> callback) {
+        requestFrame(asset, rootDir, -1L, callback);
+    }
+
+    /**
+     * Queue a render of the model posed at an explicit animation time (flipbook
+     * frame, P1 extension). {@code animTimeMs < 0} falls back to the static pose.
+     * These frames bypass the per-path memory cache and use their own disk keys.
+     */
+    public void requestFrame(ModelAsset asset, Path rootDir, long animTimeMs, Consumer<BufferedImage> callback) {
         int gen = generation.get();
-        queue.offer(new ThumbnailRequest(asset, rootDir, gen, callback));
+        queue.offer(new ThumbnailRequest(asset, rootDir, gen, callback, animTimeMs));
     }
 
     /** Get a cached thumbnail, or null if not yet rendered. */
@@ -156,7 +177,9 @@ public final class ThumbnailRenderer {
         if (!trimmed.equals(animationName)) {
             animationName = trimmed;
             cancelPending();
-            clearCache(); // pose changed → invalidate memory + disk cache so thumbnails regenerate
+            // Pose is part of the disk cache key, so old poses stay cached on
+            // disk and switching back is instant — only memory must go.
+            cache.clear();
         }
     }
 
@@ -165,7 +188,9 @@ public final class ThumbnailRenderer {
         if (clamped != teamColorIdx) {
             teamColorIdx = clamped;
             cancelPending();
-            clearCache();
+            // Team colour is part of the disk cache key (see diskCacheKey), so
+            // previous colours stay on disk and switching back is instant.
+            cache.clear();
         }
     }
 
@@ -174,6 +199,7 @@ public final class ThumbnailRenderer {
             this.renderSize = newRenderSize;
             this.thumbSize = newThumbSize;
             this.fboNeedsResize = true;
+            cache.clear(); // sizes are part of both cache keys
         }
     }
 
@@ -219,9 +245,9 @@ public final class ThumbnailRenderer {
             if (req.generation() != generation.get()) continue; // stale
 
             // Try loading from disk cache first
-            BufferedImage diskCached = loadFromDiskCache(req.asset().path());
+            BufferedImage diskCached = loadFromDiskCache(req.asset().path(), req.animTimeMs());
             if (diskCached != null && req.generation() == generation.get()) {
-                cache.put(req.asset().path(), diskCached);
+                if (req.animTimeMs() < 0) cache.put(req.asset().path(), diskCached);
                 SwingUtilities.invokeLater(() -> req.callback().accept(diskCached));
                 continue;
             }
@@ -237,8 +263,8 @@ public final class ThumbnailRenderer {
                 currentResult = null;
 
                 if (thumb != null && req.generation() == generation.get()) {
-                    cache.put(req.asset().path(), thumb);
-                    saveToDiskCache(req.asset().path(), thumb);
+                    if (req.animTimeMs() < 0) cache.put(req.asset().path(), thumb);
+                    saveToDiskCache(req.asset().path(), thumb, req.animTimeMs());
                     SwingUtilities.invokeLater(() -> req.callback().accept(thumb));
                 }
             } catch (Exception ex) {
@@ -356,10 +382,17 @@ public final class ThumbnailRenderer {
         // "None" (or an unmatched name) leaves thumbSeq null → model rendered in its default pose.
         if (!animationName.isEmpty() && !animationName.equalsIgnoreCase("None") && animData.hasAnimation()) {
             thumbSeq = findSequence(animData.sequences(), animationName);
-            if (thumbSeq != null) {
-                boneMatrices = BoneAnimator.computeWorldMatrices(
-                        animData.bones(), thumbSeq.start(), thumbSeq.start(), thumbSeq.end(), animData.globalSequences());
-            }
+        }
+        // Flipbook requests pin an explicit pose time; static thumbnails sample
+        // the first frame of the matched sequence (or the default bind pose).
+        long poseTimeMs = thumbSeq != null
+                ? (req.animTimeMs() >= 0
+                        ? Math.max(thumbSeq.start(), Math.min(thumbSeq.end(), req.animTimeMs()))
+                        : thumbSeq.start())
+                : 0;
+        if (thumbSeq != null) {
+            boneMatrices = BoneAnimator.computeWorldMatrices(
+                    animData.bones(), poseTimeMs, thumbSeq.start(), thumbSeq.end(), animData.globalSequences());
         }
 
         long[] globalSeqs = animData.globalSequences();
@@ -368,7 +401,7 @@ public final class ThumbnailRenderer {
         float[] geoAlpha = new float[geoCount];
         java.util.Arrays.fill(geoAlpha, 1.0f);
         {
-            long t = thumbSeq != null ? thumbSeq.start() : 0;
+            long t = poseTimeMs;
             long s0 = thumbSeq != null ? thumbSeq.start() : 0;
             long s1 = thumbSeq != null ? thumbSeq.end() : 0;
             for (int i = 0; i < geoCount; i++) {
@@ -383,7 +416,7 @@ public final class ThumbnailRenderer {
         // Sample per-layer alpha (KMTA) at the first frame
         float[][] layerAlpha = new float[geoCount][];
         if (!animData.layerAlpha().isEmpty()) {
-            long t = thumbSeq != null ? thumbSeq.start() : 0;
+            long t = poseTimeMs;
             long s0 = thumbSeq != null ? thumbSeq.start() : 0;
             long s1 = thumbSeq != null ? thumbSeq.end() : 0;
             for (int i = 0; i < geoCount; i++) {
@@ -407,7 +440,7 @@ public final class ThumbnailRenderer {
         float[][][] layerUVTransforms = new float[geoCount][][];
         {
             Map<Long, TextureAnimTracks> taMap = animData.textureAnims();
-            long t = thumbSeq != null ? thumbSeq.start() : 0;
+            long t = poseTimeMs;
             long s0 = thumbSeq != null ? thumbSeq.start() : 0;
             long s1 = thumbSeq != null ? thumbSeq.end() : 0;
             for (int i = 0; i < geoCount; i++) {
@@ -428,7 +461,7 @@ public final class ThumbnailRenderer {
         // Sample per-geoset color (KGAC tint) at the first frame
         float[][] geoColor = new float[geoCount][];
         {
-            long t = thumbSeq != null ? thumbSeq.start() : 0;
+            long t = poseTimeMs;
             long s0 = thumbSeq != null ? thumbSeq.start() : 0;
             long s1 = thumbSeq != null ? thumbSeq.end() : 0;
             for (int i = 0; i < geoCount; i++) {
@@ -901,26 +934,39 @@ public final class ThumbnailRenderer {
         }
     }
 
-    private Path diskCachePath(Path modelPath) {
+    private Path diskCachePath(Path modelPath, long animTimeMs) {
         if (DISK_CACHE_DIR == null) return null;
-        // Use hash of absolute path + file size + lastModified as cache key
         try {
-            String key = modelPath.toAbsolutePath().toString()
-                    + "|" + Files.size(modelPath)
-                    + "|" + Files.getLastModifiedTime(modelPath).toMillis()
-                    + "|" + thumbSize;
-            MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] hash = md.digest(key.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 16; i++) sb.append(String.format("%02x", hash[i]));
-            return DISK_CACHE_DIR.resolve(sb + ".png");
-        } catch (IOException | NoSuchAlgorithmException e) {
+            String key = diskCacheKey(modelPath.toAbsolutePath().toString(),
+                    Files.size(modelPath), Files.getLastModifiedTime(modelPath).toMillis(),
+                    teamColorIdx, animationName, renderSize, thumbSize, animTimeMs);
+            return DISK_CACHE_DIR.resolve(key + ".png");
+        } catch (IOException e) {
             return null;
         }
     }
 
-    private BufferedImage loadFromDiskCache(Path modelPath) {
-        Path cachePath = diskCachePath(modelPath);
+    /** SHA-256 (first 16 bytes, hex) of everything the rendered pose depends on.
+     *  {@code animTimeMs < 0} means the static first-frame pose. */
+    static String diskCacheKey(String absolutePath, long sizeBytes, long mtimeMillis,
+                               int teamColor, String animationName, int renderSize, int thumbSize,
+                               long animTimeMs) {
+        String key = absolutePath + "|" + sizeBytes + "|" + mtimeMillis
+                + "|" + teamColor + "|" + animationName + "|" + renderSize + "|" + thumbSize
+                + "|" + animTimeMs;
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(key.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < 16; i++) sb.append(String.format("%02x", hash[i]));
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private BufferedImage loadFromDiskCache(Path modelPath, long animTimeMs) {
+        Path cachePath = diskCachePath(modelPath, animTimeMs);
         if (cachePath == null || !Files.exists(cachePath)) return null;
         try {
             return ImageIO.read(cachePath.toFile());
@@ -929,17 +975,50 @@ public final class ThumbnailRenderer {
         }
     }
 
-    private void saveToDiskCache(Path modelPath, BufferedImage img) {
-        Path cachePath = diskCachePath(modelPath);
+    private void saveToDiskCache(Path modelPath, BufferedImage img, long animTimeMs) {
+        Path cachePath = diskCachePath(modelPath, animTimeMs);
         if (cachePath == null) return;
         try {
             ImageIO.write(img, "png", cachePath.toFile());
+            pruneDiskCacheIfNeeded();
+        } catch (IOException ignored) {}
+    }
+
+    // Disk cache stays bounded: after every 32nd save, if the folder exceeds
+    // the cap, oldest files go first until it is back to 75% of the cap.
+    private final AtomicInteger diskSaves = new AtomicInteger();
+    private static final long DISK_CACHE_MAX_BYTES = 512L * 1024 * 1024;
+
+    private void pruneDiskCacheIfNeeded() {
+        if (diskSaves.incrementAndGet() % 32 != 0) return;
+        if (DISK_CACHE_DIR == null) return;
+        try {
+            record Entry(Path path, long mtime, long size) {}
+            List<Entry> entries = new ArrayList<>();
+            long total = 0;
+            try (var files = Files.list(DISK_CACHE_DIR)) {
+                files.filter(p -> p.toString().endsWith(".png")).forEach(p -> {
+                    try {
+                        entries.add(new Entry(p, Files.getLastModifiedTime(p).toMillis(), Files.size(p)));
+                    } catch (IOException ignored) {}
+                });
+            }
+            for (Entry e : entries) total += e.size();
+            if (total <= DISK_CACHE_MAX_BYTES) return;
+            entries.sort(Comparator.comparingLong(Entry::mtime));
+            long target = DISK_CACHE_MAX_BYTES * 3 / 4;
+            for (Entry e : entries) {
+                if (total <= target) break;
+                try {
+                    if (Files.deleteIfExists(e.path())) total -= e.size();
+                } catch (IOException ignored) {}
+            }
         } catch (IOException ignored) {}
     }
 
     // ── Request record ───────────────────────────────────────────────────────
 
-    record ThumbnailRequest(ModelAsset asset, Path rootDir, int generation, Consumer<BufferedImage> callback) {
-        static final ThumbnailRequest POISON = new ThumbnailRequest(null, null, -1, null);
+    record ThumbnailRequest(ModelAsset asset, Path rootDir, int generation, Consumer<BufferedImage> callback, long animTimeMs) {
+        static final ThumbnailRequest POISON = new ThumbnailRequest(null, null, -1, null, -1L);
     }
 }

@@ -3,6 +3,9 @@ package com.hiveworkshop.ui;
 import static com.hiveworkshop.i18n.Messages.get;
 import static com.hiveworkshop.i18n.Messages.fmt;
 
+import com.hiveworkshop.edit.AnimationExportService;
+import com.hiveworkshop.edit.GifSequenceWriter;
+import com.hiveworkshop.i18n.Messages;
 import com.hiveworkshop.model.*;
 import com.hiveworkshop.parser.AppSettings;
 import com.hiveworkshop.parser.GameDataSource;
@@ -397,6 +400,133 @@ public final class ModelViewerDialog extends JFrame {
 
     // ── Animation tab ────────────────────────────────────────────────────
 
+    /** Export animation dialog (P1-9): format, fps, scale → streamed GIF / PNG sequence. */
+    private void showExportDialog() {
+        if (previewCanvas == null || previewCanvas.getCurrentSequence() == null) return;
+        SequenceInfo seq = previewCanvas.getCurrentSequence();
+        long start = seq.start();
+        long end = seq.end();
+        if (previewCanvas.hasLoopRange()) {
+            start = Math.max(start, previewCanvas.getLoopInMs());
+            end = Math.min(end, previewCanvas.getLoopOutMs());
+        }
+        if (end <= start) return;
+        final long rangeStart = start;
+        final long rangeEnd = end;
+
+        JComboBox<String> formatCombo = new JComboBox<>(
+                new String[] { get("viewer.export.gif"), get("viewer.export.png") });
+        JSpinner fpsSpinner = new JSpinner(new SpinnerNumberModel(12, 5, 30, 1));
+        JComboBox<String> scaleCombo = new JComboBox<>(new String[] { "100%", "75%", "50%", "25%" });
+        scaleCombo.setSelectedIndex(2);
+        JLabel info = new JLabel(fmt("viewer.export.frames",
+                AnimationExportService.buildTimeline(rangeStart, rangeEnd, 12).size()));
+
+        Runnable reestimate = () -> info.setText(fmt("viewer.export.frames",
+                AnimationExportService.buildTimeline(rangeStart, rangeEnd, (int) fpsSpinner.getValue()).size()));
+        fpsSpinner.addChangeListener(e -> reestimate.run());
+
+        JPanel panel = new JPanel(new GridLayout(0, 2, 8, 8));
+        panel.add(new JLabel(get("viewer.export.format")));
+        panel.add(formatCombo);
+        panel.add(new JLabel(get("viewer.export.fps")));
+        panel.add(fpsSpinner);
+        panel.add(new JLabel(get("viewer.export.scale")));
+        panel.add(scaleCombo);
+        panel.add(info);
+        panel.add(new JLabel(""));
+
+        int choice = JOptionPane.showConfirmDialog(this, panel, get("viewer.exportAnim"),
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (choice != JOptionPane.OK_OPTION) return;
+
+        final int fps = (int) fpsSpinner.getValue();
+        final double scaleFactor = switch (scaleCombo.getSelectedIndex()) {
+            case 0 -> 1.0;
+            case 1 -> 0.75;
+            case 2 -> 0.5;
+            default -> 0.25;
+        };
+        final boolean asGif = formatCombo.getSelectedIndex() == 0;
+        final List<Long> timeline = AnimationExportService.buildTimeline(rangeStart, rangeEnd, fps);
+        if (timeline.isEmpty()) return;
+
+        final String baseName = (seq.name() == null ? "anim" : seq.name())
+                .replaceAll("[^\\w\\-]+", "_");
+        javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
+        Path target;
+        if (asGif) {
+            chooser.setDialogTitle(get("viewer.exportAnim"));
+            chooser.setSelectedFile(new java.io.File(baseName + ".gif"));
+            chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("GIF", "gif"));
+            if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+            target = chooser.getSelectedFile().toPath();
+            if (!target.toString().toLowerCase(java.util.Locale.ROOT).endsWith(".gif")) {
+                target = target.resolveSibling(target.getFileName().toString() + ".gif");
+            }
+        } else {
+            chooser.setDialogTitle(get("viewer.export.pickDir"));
+            chooser.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
+            if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+            target = chooser.getSelectedFile().toPath();
+        }
+        final Path fTarget = target;
+
+        final boolean wasPlaying = previewCanvas.isPlaying();
+        previewCanvas.setPlaying(false);
+
+        ProgressMonitor monitor = new ProgressMonitor(this, get("viewer.exportAnim"), "", 0, 100);
+        new SwingWorker<Path, Void>() {
+            @Override protected Path doInBackground() {
+                try {
+                    int done = 0;
+                    GifSequenceWriter gifWriter = null;
+                    try {
+                        for (long timeMs : timeline) {
+                            if (monitor.isCanceled()) break;
+                            previewCanvas.setAnimTimeMs(timeMs);
+                            BufferedImage frame = previewCanvas.requestScreenshot().get();
+                            BufferedImage scaled = AnimationExportService.scale(frame, scaleFactor);
+                            if (asGif) {
+                                if (gifWriter == null) {
+                                    gifWriter = new GifSequenceWriter(scaled, true, fTarget);
+                                }
+                                gifWriter.writeFrame(scaled, 1000 / fps);
+                            } else {
+                                java.nio.file.Files.createDirectories(fTarget);
+                                String name = String.format("%s_%04d.png", baseName, done + 1);
+                                ImageIO.write(scaled, "png", fTarget.resolve(name).toFile());
+                            }
+                            setProgress(Math.min(100, (int) (++done * 100 / timeline.size())));
+                        }
+                    } finally {
+                        if (gifWriter != null) gifWriter.close();
+                    }
+                    return fTarget;
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+            }
+            @Override protected void done() {
+                monitor.close();
+                previewCanvas.setPlaying(wasPlaying);
+                try {
+                    Path written = get();
+                    if (!monitor.isCanceled()) {
+                        JOptionPane.showMessageDialog(ModelViewerDialog.this,
+                                fmt("viewer.export.done", timeline.size(), written.toAbsolutePath()),
+                                Messages.get("viewer.exportAnim"), JOptionPane.INFORMATION_MESSAGE);
+                    }
+                } catch (Exception ex) {
+                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    JOptionPane.showMessageDialog(ModelViewerDialog.this,
+                            fmt("viewer.export.failed", String.valueOf(cause)),
+                            Messages.get("main.error"), JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        }.execute();
+    }
+
     private JPanel buildAnimationTab() {
         ModelAnimData animData = parsedModel.animData();
         List<SequenceInfo> sequences = animData.sequences();
@@ -437,6 +567,69 @@ public final class ModelViewerDialog extends JFrame {
         playRow.add(playPauseBtn);
         playRow.add(loopCheckbox);
         panel.add(playRow);
+        panel.add(Box.createVerticalStrut(8));
+
+        // Frame stepping (P1-7): ,/. or Shift+←/→ also work when the 3D view is focused
+        JPanel stepRow = flowRow(get("viewer.frameStep"));
+        JButton stepBackBtn = new JButton(get("viewer.stepBack"));
+        JButton stepFwdBtn = new JButton(get("viewer.stepFwd"));
+        stepBackBtn.setToolTipText(get("viewer.stepTip"));
+        stepFwdBtn.setToolTipText(get("viewer.stepTip"));
+        stepBackBtn.addActionListener(e -> {
+            if (previewCanvas == null) return;
+            previewCanvas.stepFrames(-1);
+            playPauseBtn.setText(get("viewer.play"));
+        });
+        stepFwdBtn.addActionListener(e -> {
+            if (previewCanvas == null) return;
+            previewCanvas.stepFrames(1);
+            playPauseBtn.setText(get("viewer.play"));
+        });
+        stepRow.add(stepBackBtn);
+        stepRow.add(stepFwdBtn);
+        JButton exportAnimBtn = new JButton(get("viewer.exportAnim"));
+        exportAnimBtn.addActionListener(e -> showExportDialog());
+        stepRow.add(exportAnimBtn);
+        panel.add(stepRow);
+        panel.add(Box.createVerticalStrut(8));
+
+        // Loop range (P1-7): in/out points constrain playback while 循环 is enabled
+        JPanel rangeRow = flowRow(get("viewer.loopRange"));
+        JButton setInBtn = new JButton(get("viewer.setIn"));
+        JButton setOutBtn = new JButton(get("viewer.setOut"));
+        JButton clearRangeBtn = new JButton(get("viewer.clearRange"));
+        JLabel rangeLabel = new JLabel("—");
+        setInBtn.setToolTipText(get("viewer.loopRangeTip"));
+        setOutBtn.setToolTipText(get("viewer.loopRangeTip"));
+        setInBtn.addActionListener(e -> {
+            if (previewCanvas == null || previewCanvas.getCurrentSequence() == null) return;
+            SequenceInfo seq = previewCanvas.getCurrentSequence();
+            long in = previewCanvas.getAnimTimeMs();
+            long out = previewCanvas.hasLoopRange() ? previewCanvas.getLoopOutMs() : seq.end();
+            if (out <= in) out = seq.end();
+            previewCanvas.setLoopRange(in, out);
+            rangeLabel.setText(previewCanvas.hasLoopRange()
+                    ? previewCanvas.getLoopInMs() + " – " + previewCanvas.getLoopOutMs() + " ms" : "—");
+        });
+        setOutBtn.addActionListener(e -> {
+            if (previewCanvas == null || previewCanvas.getCurrentSequence() == null) return;
+            SequenceInfo seq = previewCanvas.getCurrentSequence();
+            long out = previewCanvas.getAnimTimeMs();
+            long in = previewCanvas.hasLoopRange() ? previewCanvas.getLoopInMs() : seq.start();
+            if (out <= in) in = seq.start();
+            previewCanvas.setLoopRange(in, out);
+            rangeLabel.setText(previewCanvas.hasLoopRange()
+                    ? previewCanvas.getLoopInMs() + " – " + previewCanvas.getLoopOutMs() + " ms" : "—");
+        });
+        clearRangeBtn.addActionListener(e -> {
+            if (previewCanvas != null) previewCanvas.clearLoopRange();
+            rangeLabel.setText("—");
+        });
+        rangeRow.add(setInBtn);
+        rangeRow.add(setOutBtn);
+        rangeRow.add(clearRangeBtn);
+        rangeRow.add(rangeLabel);
+        panel.add(rangeRow);
         panel.add(Box.createVerticalStrut(8));
 
         // Timeline scrubber (full-width)

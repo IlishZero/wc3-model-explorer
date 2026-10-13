@@ -3,6 +3,17 @@ package com.hiveworkshop.ui;
 import static com.hiveworkshop.i18n.Messages.get;
 import static com.hiveworkshop.i18n.Messages.fmt;
 import com.hiveworkshop.AppVersion;
+import com.hiveworkshop.edit.CsvExportService;
+import com.hiveworkshop.edit.MdlxMdlConverter;
+import com.hiveworkshop.edit.ui.BackupRestoreDialog;
+import com.hiveworkshop.edit.ui.BoneNodeManagerDialog;
+import com.hiveworkshop.edit.ui.GeosetManagerDialog;
+import com.hiveworkshop.edit.ui.KeyframeManagerDialog;
+import com.hiveworkshop.edit.ui.MaterialManagerDialog;
+import com.hiveworkshop.edit.ui.ModelSlimmingDialog;
+import com.hiveworkshop.edit.ui.SequenceManagerDialog;
+import com.hiveworkshop.edit.ui.TextureCheckDialog;
+import com.hiveworkshop.edit.ui.TextureManagerDialog;
 import com.hiveworkshop.i18n.Messages;
 import com.hiveworkshop.model.*;
 import com.hiveworkshop.parser.*;
@@ -22,6 +33,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
+import javax.swing.JMenu;
 import javax.swing.JTextField;
 import javax.swing.JMenuItem;
 import javax.swing.JPopupMenu;
@@ -36,6 +48,7 @@ import javax.swing.event.DocumentListener;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -48,6 +61,10 @@ import java.awt.Shape;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.Transferable;
 import java.awt.datatransfer.UnsupportedFlavorException;
+import java.awt.dnd.DnDConstants;
+import java.awt.dnd.DropTarget;
+import java.awt.dnd.DropTargetAdapter;
+import java.awt.dnd.DropTargetDropEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
@@ -96,6 +113,7 @@ public final class MainWindow extends JFrame {
     private final JButton recentButton = new JButton(get("main.recent"));
     private final JComboBox<SortOrder> sortCombo = new JComboBox<>(SortOrder.values());
     private final JToggleButton advancedFiltersToggle = new JToggleButton(get("main.advancedFilters"));
+    private final JButton exportCsvButton = new JButton(get("main.exportCsv"));
     private final JPanel advancedFiltersPanel = new JPanel(new BorderLayout());
     private final JTabbedPane advancedFiltersTabs = new JTabbedPane(JTabbedPane.TOP);
     private final JPanel filtersGridPanel = new JPanel(new GridLayout(0, 4, 8, 6));
@@ -124,6 +142,7 @@ public final class MainWindow extends JFrame {
     private SwingWorker<?, ?> currentScanWorker;
     private volatile java.util.concurrent.atomic.AtomicBoolean scanCancelled;
     private ThumbnailRenderer thumbnailRenderer;
+    private FlipbookManager flipbook;
     private Timer shimmerTimer;
     private int pendingThumbnails;
     private int totalThumbnails;
@@ -147,11 +166,29 @@ public final class MainWindow extends JFrame {
             public void windowClosing(WindowEvent e) {
                 persistWindowAndFilters();
                 if (thumbnailRenderer != null) thumbnailRenderer.shutdown();
+                if (flipbook != null) flipbook.stop();
                 if (currentMapSource != null) {
                     currentMapSource.close();
                     currentMapSource = null;
                 }
                 GameDataSource.getInstance().clearMapSource();
+            }
+
+            @Override public void windowIconified(WindowEvent e) {
+                if (flipbook != null) flipbook.pause();
+            }
+
+            @Override public void windowDeiconified(WindowEvent e) {
+                if (flipbook != null) flipbook.resume();
+            }
+        });
+        addWindowFocusListener(new WindowAdapter() {
+            @Override public void windowLostFocus(WindowEvent e) {
+                if (flipbook != null) flipbook.pause();
+            }
+
+            @Override public void windowGainedFocus(WindowEvent e) {
+                if (flipbook != null) flipbook.resume();
             }
         });
     }
@@ -185,6 +222,7 @@ public final class MainWindow extends JFrame {
         filterControls.add(thumbnailTeamColorCombo);
         filterControls.add(favoritesToggle);
         filterControls.add(advancedFiltersToggle);
+        filterControls.add(exportCsvButton);
         filterRow.add(filterControls, BorderLayout.EAST);
         topPanel.add(filterRow, BorderLayout.SOUTH);
         buildAdvancedFiltersPanel();
@@ -212,6 +250,24 @@ public final class MainWindow extends JFrame {
         bottomBar.add(dataSourceLabel, BorderLayout.EAST);
         rootPanel.add(bottomBar, BorderLayout.SOUTH);
         setContentPane(rootPanel);
+
+        // Shell drag-and-drop import (P1-4): directories/maps rescan the root,
+        // model files open in the viewer. Covers the whole window; drops landing
+        // directly on the asset list go through its TransferHandler instead.
+        new DropTarget(rootPanel, new DropTargetAdapter() {
+            @Override public void drop(DropTargetDropEvent event) {
+                try {
+                    event.acceptDrop(DnDConstants.ACTION_COPY);
+                    @SuppressWarnings("unchecked")
+                    List<File> files = (List<File>) event.getTransferable()
+                            .getTransferData(DataFlavor.javaFileListFlavor);
+                    handleExternalFileDrop(files);
+                    event.dropComplete(true);
+                } catch (Exception ex) {
+                    event.dropComplete(false);
+                }
+            }
+        });
     }
 
     private void wireEvents() {
@@ -221,6 +277,10 @@ public final class MainWindow extends JFrame {
         settingsButton.addActionListener(event -> openSettings());
         recentButton.addActionListener(event -> showRecentFoldersPopup());
         favoritesToggle.addActionListener(event -> applyFilter());
+        exportCsvButton.addActionListener(event -> exportCsv());
+        assetList.addListSelectionListener(event -> {
+            if (!event.getValueIsAdjusting()) updateFlipbook();
+        });
         rootField.addActionListener(event -> startScan(false));
         advancedFiltersToggle.addActionListener(event -> {
             advancedFiltersPanel.setVisible(advancedFiltersToggle.isSelected());
@@ -246,6 +306,7 @@ public final class MainWindow extends JFrame {
             if (thumbnailRenderer != null) {
                 thumbnailRenderer.setTeamColor(teamColor);
             }
+            updateFlipbook(); // flipbook frames are per-colour — re-render for the new one
             applyFilter();
         });
         wireFieldForFiltering(animationFilterField);
@@ -440,6 +501,7 @@ public final class MainWindow extends JFrame {
     }
 
     private void applyFilter() {
+        if (flipbook != null) flipbook.stop(); // list contents are about to change
         String needle = searchField.getText().trim().toLowerCase(Locale.ROOT);
         PortraitFilter portraitFilter = (PortraitFilter) portraitFilterCombo.getSelectedItem();
         if (portraitFilter == null) {
@@ -560,6 +622,10 @@ public final class MainWindow extends JFrame {
         String rootText = rootField.getText().trim();
         if (!rootText.isEmpty()) {
             startScan(false);
+        } else {
+            // First launch: no model library configured yet — walk the user
+            // straight into picking one instead of a dead empty list.
+            SwingUtilities.invokeLater(this::chooseDirectory);
         }
     }
 
@@ -692,6 +758,24 @@ public final class MainWindow extends JFrame {
         javax.swing.JMenuItem copyWithTexItem = new javax.swing.JMenuItem(get("main.copyWithTextures"));
         copyWithTexItem.addActionListener(e -> copyModelsWithTextures(assets));
         popup.add(copyWithTexItem);
+
+        // MDX↔MDL conversion: batch keeps its own submenu; single selection
+        // lives inside the consolidated "Edit Model" submenu below.
+        if (multiple) {
+            addConvertMenuItems(popup, assets);
+        }
+
+        if (!multiple) {
+            String selectedExt = assets.get(0).fileExtension().toLowerCase(Locale.ROOT);
+            if ("mdx".equals(selectedExt) || "mdl".equals(selectedExt)) {
+                JMenuItem texCheckItem = new JMenuItem(get("main.textureCheck"));
+                texCheckItem.addActionListener(e ->
+                        TextureCheckDialog.open(this, assets.get(0).path()));
+                popup.add(texCheckItem);
+
+                popup.add(buildEditSubmenu(assets.get(0)));
+            }
+        }
 
         // Open file location
         if (!multiple) {
@@ -910,6 +994,241 @@ public final class MainWindow extends JFrame {
         }
     }
 
+    /** Exports the currently visible (filtered) asset list to CSV (P1-8). */
+    private void exportCsv() {
+        List<ModelAsset> visible = new ArrayList<>();
+        for (int i = 0; i < listModel.size(); i++) visible.add(listModel.get(i));
+        if (visible.isEmpty()) {
+            statusLabel.setText(get("main.nothingToExport"));
+            return;
+        }
+        javax.swing.JFileChooser chooser = new javax.swing.JFileChooser();
+        chooser.setDialogTitle(get("main.exportCsvTitle"));
+        chooser.setSelectedFile(new File("model-list-"
+                + java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")
+                        .format(java.time.LocalDateTime.now()) + ".csv"));
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("CSV", "csv"));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        Path target = chooser.getSelectedFile().toPath();
+        Path root = currentScanRoot();
+        String[] header = {
+                get("csv.col.name"), get("csv.col.path"), get("csv.col.sizeKb"),
+                get("csv.col.vertices"), get("csv.col.faces"), get("csv.col.bones"),
+                get("csv.col.sequences"), get("csv.col.animations"), get("csv.col.textures"),
+                get("csv.col.missing"),
+        };
+        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+        new SwingWorker<Path, Void>() {
+            @Override protected Path doInBackground() throws Exception {
+                List<CsvExportService.Row> rows = CsvExportService.collect(visible, root);
+                CsvExportService.writeCsv(target, header, rows);
+                return target;
+            }
+            @Override protected void done() {
+                setCursor(Cursor.getDefaultCursor());
+                try {
+                    Path written = get();
+                    String message = fmt("main.exportDone", visible.size(),
+                            written.toAbsolutePath().toString());
+                    int choice = JOptionPane.showConfirmDialog(MainWindow.this, message,
+                            Messages.get("main.exportCsvTitle"), JOptionPane.OK_CANCEL_OPTION,
+                            JOptionPane.INFORMATION_MESSAGE);
+                    if (choice == JOptionPane.OK_OPTION) {
+                        try {
+                            java.awt.Desktop.getDesktop().open(written.getParent().toFile());
+                        } catch (Exception ignored) {}
+                    }
+                } catch (Exception ex) {
+                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    showErrorDialog(MainWindow.this, fmt("main.exportFailed", String.valueOf(cause)),
+                            Messages.get("main.error"));
+                }
+            }
+        }.execute();
+    }
+
+    /** Entry point for drag-and-drop imports from the OS shell (P1-4). */
+    private void handleExternalFileDrop(List<File> files) {
+        if (files == null || files.isEmpty()) return;
+        List<Path> modelFiles = new ArrayList<>();
+        for (File file : files) {
+            Path path = file.toPath();
+            String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+            if (file.isDirectory() || name.endsWith(".w3x") || name.endsWith(".w3m")) {
+                rootField.setText(path.toString());
+                saveCurrentRootDirectory();
+                startScan(false);
+                return;
+            }
+            if (name.endsWith(".mdx") || name.endsWith(".mdl")) {
+                modelFiles.add(path);
+            }
+        }
+        if (modelFiles.isEmpty()) {
+            statusLabel.setText(get("main.dropUnsupported"));
+            return;
+        }
+        if (modelFiles.size() > OPEN_IN_VIEWER_WARN_THRESHOLD) {
+            int choice = JOptionPane.showConfirmDialog(this,
+                    fmt("main.openInViewerWarn", modelFiles.size()),
+                    get("main.openInViewerWarnTitle"),
+                    JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (choice != JOptionPane.OK_OPTION) return;
+        }
+        int cascadeIndex = 0;
+        for (Path modelPath : modelFiles) {
+            ModelAsset asset = new ModelAsset(modelPath, modelPath.toFile().length(),
+                    ModelMetadataExtractor.extract(modelPath));
+            showModelDetails(asset, cascadeIndex++);
+        }
+    }
+
+    /** Batch conversion submenu for multi-select (single-file conversion lives in the edit submenu). */
+    private void addConvertMenuItems(JPopupMenu popup, List<ModelAsset> assets) {
+        List<ModelAsset> mdxAssets = new ArrayList<>();
+        List<ModelAsset> mdlAssets = new ArrayList<>();
+        for (ModelAsset a : assets) {
+            String ext = a.fileExtension().toLowerCase(Locale.ROOT);
+            if ("mdx".equals(ext)) mdxAssets.add(a);
+            else if ("mdl".equals(ext)) mdlAssets.add(a);
+        }
+        if (mdxAssets.isEmpty() && mdlAssets.isEmpty()) return;
+
+        JMenu convertMenu = new JMenu(get("main.convertMenu"));
+        if (!mdxAssets.isEmpty()) {
+            JMenuItem toMdl = new JMenuItem(fmt("main.convertToMdlBatch", mdxAssets.size()));
+            toMdl.addActionListener(e -> runConversion(mdxAssets));
+            convertMenu.add(toMdl);
+        }
+        if (!mdlAssets.isEmpty()) {
+            JMenuItem toMdx = new JMenuItem(fmt("main.convertToMdxBatch", mdlAssets.size()));
+            toMdx.addActionListener(e -> runConversion(mdlAssets));
+            convertMenu.add(toMdx);
+        }
+        popup.add(convertMenu);
+    }
+
+    /** Consolidated editor entry point for one model file (P3 UI reorganisation). */
+    private javax.swing.JMenu buildEditSubmenu(ModelAsset asset) {
+        JMenu editMenu = new JMenu(get("main.editMenu"));
+        String ext = asset.fileExtension().toLowerCase(Locale.ROOT);
+        if ("mdx".equals(ext)) {
+            JMenuItem toMdl = new JMenuItem(get("main.convertToMdl"));
+            toMdl.addActionListener(e -> runConversion(List.of(asset)));
+            editMenu.add(toMdl);
+        } else if ("mdl".equals(ext)) {
+            JMenuItem toMdx = new JMenuItem(get("main.convertToMdx"));
+            toMdx.addActionListener(e -> runConversion(List.of(asset)));
+            editMenu.add(toMdx);
+        }
+        JMenuItem seqItem = new JMenuItem(get("main.sequenceManager"));
+        seqItem.addActionListener(e ->
+                SequenceManagerDialog.open(this, asset.path(), () -> startScan(false)));
+        editMenu.add(seqItem);
+
+        JMenuItem geosetItem = new JMenuItem(get("main.geosetManager"));
+        geosetItem.addActionListener(e ->
+                GeosetManagerDialog.open(this, asset.path(), () -> startScan(false)));
+        editMenu.add(geosetItem);
+
+        JMenuItem texItem = new JMenuItem(get("main.textureManager"));
+        texItem.addActionListener(e ->
+                TextureManagerDialog.open(this, asset.path(), () -> startScan(false)));
+        editMenu.add(texItem);
+
+        JMenuItem matItem = new JMenuItem(get("main.materialManager"));
+        matItem.addActionListener(e ->
+                MaterialManagerDialog.open(this, asset, () -> startScan(false), a -> showModelDetails(a, 0)));
+        editMenu.add(matItem);
+
+        JMenuItem boneItem = new JMenuItem(get("main.boneManager"));
+        boneItem.addActionListener(e ->
+                BoneNodeManagerDialog.open(this, asset, () -> startScan(false), a -> showModelDetails(a, 0)));
+        editMenu.add(boneItem);
+
+        JMenuItem keyframeItem = new JMenuItem(get("main.keyframeManager"));
+        keyframeItem.addActionListener(e ->
+                KeyframeManagerDialog.open(this, asset, () -> startScan(false), a -> showModelDetails(a, 0)));
+        editMenu.add(keyframeItem);
+
+        JMenuItem slimItem = new JMenuItem(get("main.slimWizard"));
+        slimItem.addActionListener(e ->
+                ModelSlimmingDialog.open(this, asset.path(), () -> startScan(false)));
+        editMenu.add(slimItem);
+
+        editMenu.addSeparator();
+        JMenuItem restoreItem = new JMenuItem(get("main.restoreBackup"));
+        restoreItem.addActionListener(e ->
+                BackupRestoreDialog.open(this, asset.path(), () -> startScan(false)));
+        editMenu.add(restoreItem);
+        return editMenu;
+    }
+
+    private void runConversion(List<ModelAsset> assets) {
+        List<Path> sources = new ArrayList<>();
+        for (ModelAsset a : assets) sources.add(a.path());
+        setCursor(Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR));
+        new SwingWorker<List<MdlxMdlConverter.ConversionResult>, Void>() {
+            @Override protected List<MdlxMdlConverter.ConversionResult> doInBackground() {
+                List<MdlxMdlConverter.ConversionResult> results = new ArrayList<>();
+                for (Path source : sources) results.add(MdlxMdlConverter.convert(source));
+                return results;
+            }
+            @Override protected void done() {
+                setCursor(Cursor.getDefaultCursor());
+                try {
+                    showConversionSummary(get());
+                } catch (Exception ex) {
+                    Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                    showErrorDialog(MainWindow.this, String.valueOf(cause), Messages.get("main.error"));
+                }
+            }
+        }.execute();
+    }
+
+    private void showConversionSummary(List<MdlxMdlConverter.ConversionResult> results) {
+        int converted = 0;
+        int skipped = 0;
+        int failed = 0;
+        StringBuilder details = new StringBuilder();
+        int shown = 0;
+        for (MdlxMdlConverter.ConversionResult r : results) {
+            switch (r.status()) {
+                case CONVERTED -> {
+                    converted++;
+                    if (shown < 8) {
+                        details.append(fmt("main.convertConverted",
+                                r.source().getFileName(), r.target().getFileName())).append('\n');
+                        shown++;
+                    }
+                }
+                case SKIPPED_EXISTS -> {
+                    skipped++;
+                    if (shown < 8) {
+                        details.append(fmt("main.convertSkipped", r.target().getFileName())).append('\n');
+                        shown++;
+                    }
+                }
+                case FAILED -> {
+                    failed++;
+                    if (shown < 8) {
+                        details.append(fmt("main.convertFailed", r.source().getFileName(), r.message())).append('\n');
+                        shown++;
+                    }
+                }
+            }
+        }
+        if (results.size() > shown) {
+            details.append(fmt("main.convertMore", results.size() - shown)).append('\n');
+        }
+        String message = fmt("main.convertDone", converted, skipped, failed);
+        if (!details.isEmpty()) {
+            message += "\n" + details.toString().stripTrailing();
+        }
+        JOptionPane.showMessageDialog(this, message, get("main.convertTitle"), JOptionPane.INFORMATION_MESSAGE);
+        if (converted > 0) startScan(false);
+    }
+
     private void copyAssetFilesToClipboard(List<ModelAsset> assets) {
         List<File> files = assets.stream()
                 .map(asset -> asset.path().toFile())
@@ -1048,6 +1367,25 @@ public final class MainWindow extends JFrame {
         public int getSourceActions(JComponent c) {
             return COPY;
         }
+
+        @Override
+        public boolean canImport(TransferSupport support) {
+            return support.isDataFlavorSupported(DataFlavor.javaFileListFlavor);
+        }
+
+        @Override
+        public boolean importData(TransferSupport support) {
+            if (!canImport(support)) return false;
+            try {
+                @SuppressWarnings("unchecked")
+                List<File> files = (List<File>) support.getTransferable()
+                        .getTransferData(DataFlavor.javaFileListFlavor);
+                handleExternalFileDrop(files);
+                return true;
+            } catch (Exception ex) {
+                return false;
+            }
+        }
     }
 
     private static final class FileListTransferable implements Transferable {
@@ -1078,6 +1416,25 @@ public final class MainWindow extends JFrame {
 
     private void showModelDetails(ModelAsset asset) {
         showModelDetails(asset, 0);
+    }
+
+    /** Starts/stops the selected-model flipbook (plan A) for the current selection. */
+    private void updateFlipbook() {
+        if (flipbook == null) return;
+        List<ModelAsset> selected = selectedAssets();
+        if (selected.isEmpty()) {
+            flipbook.stop();
+        } else {
+            flipbook.startFor(selected.get(0), currentScanRoot());
+        }
+    }
+
+    /** Repaints only the selected card when a flipbook frame advances. */
+    private void repaintSelectedCell() {
+        int index = assetList.getSelectedIndex();
+        if (index < 0) return;
+        java.awt.Rectangle bounds = assetList.getCellBounds(index, index);
+        if (bounds != null) assetList.repaint(bounds);
     }
 
     /** Opens a model in its own viewer window; cascadeIndex offsets the window so
@@ -1136,6 +1493,7 @@ public final class MainWindow extends JFrame {
         // Ensure thumbnail renderer exists
         ensureThumbnailRenderer();
         thumbnailRenderer.cancelPending();
+        if (flipbook != null) flipbook.stop(); // full rescan invalidates everything
 
         final Path root = currentScanRoot();
 
@@ -1178,6 +1536,7 @@ public final class MainWindow extends JFrame {
     private void ensureThumbnailRenderer() {
         if (thumbnailRenderer != null) return;
         thumbnailRenderer = new ThumbnailRenderer();
+        flipbook = new FlipbookManager(thumbnailRenderer, this::repaintSelectedCell);
         applySettingsToThumbnailRenderer();
     }
 
@@ -1574,8 +1933,10 @@ public final class MainWindow extends JFrame {
                     previewLabel.setText(get("main.hdUnsupportedBadge"));
                 } else {
                     // Show thumbnail if available, otherwise shimmer
-                    BufferedImage thumb = thumbnailRenderer != null
-                            ? thumbnailRenderer.getThumbnail(asset.path()) : null;
+                    BufferedImage thumb = flipbook != null ? flipbook.currentFrame(asset.path()) : null;
+                    if (thumb == null && thumbnailRenderer != null) {
+                        thumb = thumbnailRenderer.getThumbnail(asset.path());
+                    }
                     if (thumb != null) {
                         previewLabel.setThumbnail(thumb, previewSize);
                         previewLabel.setText("");

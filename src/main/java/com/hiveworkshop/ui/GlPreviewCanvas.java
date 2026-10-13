@@ -1393,6 +1393,16 @@ public final class GlPreviewCanvas extends AWTGLCanvas {
         long duration = seq.end() - seq.start();
         if (duration <= 0) return;
         long newTime = animTimeMs + deltaMs;
+        // Loop range (A/B points) takes precedence over the full-sequence wrap,
+        // but only while looping is enabled — looping off still stops at seq end.
+        if (animLooping && hasLoopRange()) {
+            long in = Math.max(seq.start(), loopInMs);
+            long out = Math.min(seq.end(), loopOutMs);
+            if (out > in && newTime >= out) {
+                animTimeMs = wrapLoopRange(newTime, in, out);
+                return;
+            }
+        }
         if (newTime >= seq.end()) {
             if (animLooping) {
                 long t = newTime - seq.start();
@@ -1406,6 +1416,14 @@ public final class GlPreviewCanvas extends AWTGLCanvas {
         } else {
             animTimeMs = newTime;
         }
+    }
+
+    /** Wraps playback time into the [in, out) range; pure math so it is unit-testable. */
+    static long wrapLoopRange(long newTimeMs, long inMs, long outMs) {
+        long len = outMs - inMs;
+        long t = (newTimeMs - inMs) % len;
+        if (t < 0) t += len;
+        return inMs + t;
     }
 
     private void sampleGeosetAlpha() {
@@ -1763,6 +1781,7 @@ public final class GlPreviewCanvas extends AWTGLCanvas {
         SequenceInfo seq = animData.sequences().get(idx);
         animTimeMs    = seq.start();
         lastNanoNs    = 0L;
+        clearLoopRange(); // a range never carries over to another sequence
         resetRibbons();
         resetParticles2();
         var cb = onSequenceChanged;
@@ -1793,6 +1812,40 @@ public final class GlPreviewCanvas extends AWTGLCanvas {
         return future;
     }
     public void setLooping(boolean l)          { animLooping = l; }
+
+    // ── Frame stepping & loop range (P1-7) ───────────────────────────────────
+
+    /** One "frame" for stepping purposes: ~30 fps, i.e. how far playback moves per frame. */
+    public static final long FRAME_STEP_MS = 33;
+    private volatile long loopInMs  = -1L;
+    private volatile long loopOutMs = -1L;
+
+    /** Steps the animation by {@code frames} frames (~30 fps each) and pauses playback. */
+    public void stepFrames(int frames) {
+        animPlaying = false;
+        setAnimTimeMs(animTimeMs + frames * FRAME_STEP_MS);
+    }
+
+    /** Sets the looping sub-range in absolute animation ms; ignored unless it is a valid span. */
+    public void setLoopRange(long inMs, long outMs) {
+        if (outMs > inMs) {
+            loopInMs = inMs;
+            loopOutMs = outMs;
+        }
+    }
+
+    public void clearLoopRange() {
+        loopInMs = -1L;
+        loopOutMs = -1L;
+    }
+
+    public boolean hasLoopRange() {
+        return loopInMs >= 0 && loopOutMs > loopInMs;
+    }
+
+    public long getLoopInMs()  { return loopInMs; }
+    public long getLoopOutMs() { return loopOutMs; }
+
     private volatile Runnable onAnimationFinished;
     public void setOnAnimationFinished(Runnable r) { onAnimationFinished = r; }
     private volatile java.util.function.IntConsumer onSequenceChanged;
@@ -2921,7 +2974,13 @@ public final class GlPreviewCanvas extends AWTGLCanvas {
             @Override public void keyPressed(java.awt.event.KeyEvent e) {
                 int seqCount = animData.sequences().size();
                 if (seqCount == 0) return;
-                if (e.getKeyCode() == java.awt.event.KeyEvent.VK_RIGHT || e.getKeyCode() == java.awt.event.KeyEvent.VK_DOWN) {
+                if (e.getKeyCode() == java.awt.event.KeyEvent.VK_PERIOD
+                        || (e.getKeyCode() == java.awt.event.KeyEvent.VK_RIGHT && e.isShiftDown())) {
+                    stepFrames(1);
+                } else if (e.getKeyCode() == java.awt.event.KeyEvent.VK_COMMA
+                        || (e.getKeyCode() == java.awt.event.KeyEvent.VK_LEFT && e.isShiftDown())) {
+                    stepFrames(-1);
+                } else if (e.getKeyCode() == java.awt.event.KeyEvent.VK_RIGHT || e.getKeyCode() == java.awt.event.KeyEvent.VK_DOWN) {
                     setSequence((currentSeqIdx + 1) % seqCount);
                     setPlaying(true);
                 } else if (e.getKeyCode() == java.awt.event.KeyEvent.VK_LEFT || e.getKeyCode() == java.awt.event.KeyEvent.VK_UP) {
